@@ -16445,6 +16445,47 @@ _RP_RENEW_SECONDS_BY_CODE = {
     "1w": 7 * 86400, "2w": 15 * 86400, "1m": 30 * 86400,
 }
 
+# 🆕 (Renew billing fix) code → (days, hours) — /prices API এর days/hours ফিল্ডের সাথে
+# ম্যাচ করার জন্য। Renew এ ইউজারের কাছ থেকে ঠিক কেনার সময়ের মতোই দাম কাটা হয়।
+_RP_RENEW_DAYS_HOURS_BY_CODE = {
+    "2h": (0, 2), "12h": (0, 12),
+    "1d": (1, 0), "3d": (3, 0), "1w": (7, 0), "2w": (15, 0), "1m": (30, 0),
+}
+_rp_renew_table_cache = {}   # pkg_id -> (ts, table) — শুধু বাটনে দাম দেখানোর জন্য (৬০ সেকেন্ড)
+
+def _rp_renew_price_table(db, pkg_id, use_cache=False):
+    """{code: (usd, bdt)} — কেনার ফ্লোর মতোই live /prices + admin-সেট override + USD→BDT rate।
+    যে মেয়াদের দাম খুঁজে পাওয়া যায় না সেটা টেবিলে থাকে না। ব্যর্থ হলে {} রিটার্ন করে।"""
+    if not pkg_id:
+        return {}
+    if use_cache:
+        hit = _rp_renew_table_cache.get(str(pkg_id))
+        if hit and _time_module.time() - hit[0] < 60:
+            return hit[1]
+    prices = realproxy_get_prices(pkg_id)
+    if not prices:
+        return {}
+    pkg_name = next((p.get("package_name", "") for p in (realproxy_get_packages() or [])
+                     if str(p.get("id")) == str(pkg_id)), "")
+    prices = _rp_apply_price_overrides(_rp_static_price_key(pkg_name), prices)
+    rate = get_proxy_usd_bdt_rate(db)
+    table = {}
+    for code, (w_days, w_hours) in _RP_RENEW_DAYS_HOURS_BY_CODE.items():
+        for pr in prices:
+            d = float(pr.get("days", 0) or 0)
+            h = float(pr.get("hours", 0) or 0)
+            if abs(d - w_days) < 0.001 and abs(h - w_hours) < 0.001:
+                usd = float(pr.get("price", 0) or 0)
+                if usd > 0:
+                    table[code] = (usd, round(usd * rate, 2))
+                break
+    _rp_renew_table_cache[str(pkg_id)] = (_time_module.time(), table)
+    return table
+
+def _rp_renew_price(db, pkg_id, code):
+    """(usd, bdt) অথবা None — চার্জের সময় সবসময় ফ্রেশ (cache ছাড়া) দাম আনা হয়।"""
+    return _rp_renew_price_table(db, pkg_id, use_cache=False).get(code)
+
 def _rp_find_current_parent_id(db, user_id, pid, pkg_id, details):
     """এই প্রক্সির বর্তমান parent_proxy_id বের করে — আগে order এ সেভ করা আছে কিনা দেখে,
     না থাকলে (পুরনো order) country/city/service_provider মিলিয়ে /parent-proxies থেকে
@@ -16541,9 +16582,18 @@ def _rp_render_action_menu(call, db, lang, user_id, pid):
     )
     status = str(details.get("status") or "").upper()
     if status == "ACTIVE":
+        # 🆕 Renew বাটনে দাম দেখানো — যা দেখানো হয় সেটাই কাটা হয়। দাম আনতে সমস্যা হলে বাটন আগের মতোই থাকে।
+        try:
+            _renew_prices = _rp_renew_price_table(db, (_order_for_pid or {}).get("pkg_id"), use_cache=True)
+        except Exception as _pe:
+            logging.error(f"renew price table error: {_pe}")
+            _renew_prices = {}
         def _renew_btn(code):
             _c, bn, en, _d = next(o for o in _RP_RENEW_OPTIONS if o[0] == code)
-            return InlineBtn(en if lang != "bn" else bn, callback_data=f"rpm_renew_{code}_{pid}")
+            _txt = en if lang != "bn" else bn
+            if code in _renew_prices:
+                _txt += f" — ৳{_renew_prices[code][1]}"
+            return InlineBtn(_txt, callback_data=f"rpm_renew_{code}_{pid}")
         markup.row(_renew_btn("2h"), _renew_btn("12h"))
         markup.row(_renew_btn("1d"), _renew_btn("3d"))
         markup.row(_renew_btn("1w"), _renew_btn("2w"))
@@ -17235,34 +17285,20 @@ def _handle_realproxy_callback_worker(call):
             duration = _RP_RENEW_DURATION_BY_CODE.get(code)
             if not pid or duration is None:
                 return
-            ok, resp_data, err = realproxy_renew_proxy(pid, duration)
-            if not ok:
-                friendly_err = _realproxy_friendly_error(err)
-                bot.answer_callback_query(call.id, (f"❌ রিনিউ ব্যর্থ: {friendly_err}" if lang == "bn" else f"❌ Renew failed: {friendly_err}"), show_alert=True)
-                return
-            label = _RP_RENEW_LABEL_BY_CODE.get(code, code)
-            # 🆕 (Point 1 fix) — renew সফল হলে order এ সেভ করা expires_at_ts
-            # renew এর পরিমাণ অনুযায়ী বাড়িয়ে দাও, যাতে My Proxy তে সঠিক
-            # নতুন countdown দেখা যায়। মেয়াদ শেষ হয়ে যাওয়া প্রক্সির ক্ষেত্রে
-            # renew করার মুহূর্ত থেকে গোনা হয়, না হয় আগের expiry থেকে যোগ হয়।
-            add_seconds = _RP_RENEW_SECONDS_BY_CODE.get(code, 0)
-            if add_seconds:
-                fresh_db = load_db()
-                order = _rp_get_order_by_pid(fresh_db, user_id, pid)
-                if order is not None:
-                    def _bump(rec, _add=add_seconds):
-                        _now = _time_module.time()
-                        _base = rec.get("expires_at_ts") or _now
-                        if _base < _now:
-                            _base = _now
-                        rec["expires_at_ts"] = _base + _add
-                        return rec
-                    # 🛡️ atomic — দুটো renew একসাথে চললেও সময় হারায় না
-                    if not _rp_store_modify(user_id, order, _bump):
-                        logging.error(f"rpm_renew: store update failed user={user_id} pid={pid}")
-                    db = fresh_db
-            bot.answer_callback_query(call.id, (f"✅ {label} এর জন্য রিনিউ হয়েছে।" if lang == "bn" else f"✅ Renewed for {label}."), show_alert=True)
-            _rp_render_action_menu(call, db, lang, user_id, pid)
+            # ⚡ ডাবল-ক্লিক গার্ড — একই ইউজারের একসাথে একটাই renew/purchase চলবে (দুবার দাম কাটা ঠেকাতে)
+            with _rp_confirm_lock:
+                if user_id in _rp_confirming:
+                    try:
+                        bot.answer_callback_query(call.id)
+                    except Exception:
+                        pass
+                    return
+                _rp_confirming.add(user_id)
+            try:
+                _rp_do_renew(call, lang, str(user_id), pid, code, duration)
+            finally:
+                with _rp_confirm_lock:
+                    _rp_confirming.discard(user_id)
             return
 
         if data.startswith("rpm_switch_"):
@@ -18022,6 +18058,100 @@ def _rp_get_user_proxy_orders(db, user_id):
             except Exception as e:
                 logging.error(f"rp_store backfill error [{uid}]: {e}")
     return sorted(merged.values(), key=lambda o: o.get("purchased_at_ts") or 0)
+
+
+def _rp_do_renew(call, lang, user_id, pid, code, duration):
+    """🔄 My Proxy → Renew। আগে শুধু provider API কল হতো, ইউজারের ব্যালেন্স কাটা হতো না।
+    এখন: দাম বের করো (কেনার মতোই) → ব্যালেন্স চেক → provider renew → সফল হলে ব্যালেন্স কাটো →
+    মেয়াদ বাড়াও → লগ। provider renew ব্যর্থ হলে ব্যালেন্স কাটা হয় না।"""
+    def _alert(bn, en):
+        try:
+            bot.answer_callback_query(call.id, bn if lang == "bn" else en, show_alert=True)
+        except Exception:
+            pass
+
+    db = load_db()
+    order = _rp_get_order_by_pid(db, user_id, pid)
+    if order is None:
+        _alert("❌ এই প্রক্সি আপনার অ্যাকাউন্টে পাওয়া যায়নি।", "❌ This proxy was not found on your account.")
+        return
+
+    priced = _rp_renew_price(db, order.get("pkg_id"), code)
+    if not priced:
+        # দাম না জেনে renew করলে ফ্রিতে হয়ে যেত — তাই আটকে দেওয়া হলো
+        _alert("⚠️ এই মেয়াদের রিনিউ দাম পাওয়া যায়নি, তাই রিনিউ করা যাচ্ছে না। আপনার ব্যালেন্স কাটা হয়নি।",
+               "⚠️ Renew price for this duration isn't available, so it can't be renewed. You were not charged.")
+        return
+    usd, bdt = priced
+
+    balance = float(db.get("users", {}).get(user_id, {}).get("balance", 0))
+    if balance < bdt:
+        shortage = round(bdt - balance, 2)
+        _alert(f"❌ ব্যালেন্স অপর্যাপ্ত! প্রয়োজন ৳{bdt}, আপনার আছে ৳{balance} (৳{shortage} কম)।",
+               f"❌ Insufficient balance! Need ৳{bdt}, you have ৳{balance} (short ৳{shortage}).")
+        return
+
+    ok, resp_data, err = realproxy_renew_proxy(pid, duration)
+    if not ok:
+        friendly_err = _realproxy_friendly_error(err)
+        _alert(f"❌ রিনিউ ব্যর্থ: {friendly_err}\nআপনার ব্যালেন্স কাটা হয়নি।",
+               f"❌ Renew failed: {friendly_err}\nYou were not charged.")
+        return
+
+    # ── Balance কাটো (কেনার মতোই targeted sync write) ──
+    new_balance = None
+    try:
+        db = load_db()   # ফ্রেশ balance
+        cur_balance = float(db["users"][user_id].get("balance", 0))
+        new_balance = round(cur_balance - bdt, 2)
+        db["users"][user_id]["balance"] = new_balance
+        update_db_path(f"/users/{user_id}/balance", new_balance, _async=False)
+    except Exception as e:
+        logging.error(f"rpm_renew: balance deduct FAILED user={user_id} pid={pid} amount={bdt}: {e}")
+        try:
+            bot.send_message(ADMIN_ID, f"⚠️ <b>Real Proxy renew হয়েছে কিন্তু ব্যালেন্স কাটা যায়নি!</b>\n"
+                                       f"👤 User: <code>{user_id}</code>\n🆔 Proxy: <code>{pid}</code>\n"
+                                       f"💰 কাটার কথা: ৳{bdt}", parse_mode="HTML")
+        except Exception:
+            pass
+
+    label = _RP_RENEW_LABEL_BY_CODE.get(code, code)
+    add_seconds = _RP_RENEW_SECONDS_BY_CODE.get(code, 0)
+    renew_date = get_now()
+
+    # ── মেয়াদ বাড়াও + renew ইতিহাস সেভ (My Orders লিস্টে হাত দিই না — আলাদা স্টোরেই থাকে) ──
+    def _bump(rec, _add=add_seconds):
+        _now = _time_module.time()
+        _base = rec.get("expires_at_ts") or _now
+        if _base < _now:
+            _base = _now
+        if _add:
+            rec["expires_at_ts"] = _base + _add
+        hist = list(rec.get("renewals") or [])
+        hist.append({"date": renew_date, "label": label, "price": bdt, "usd": usd, "ts": _now})
+        rec["renewals"] = hist[-20:]
+        return rec
+    # 🛡️ atomic — দুটো renew একসাথে চললেও সময় হারায় না
+    if not _rp_store_modify(user_id, order, _bump):
+        logging.error(f"rpm_renew: store update failed user={user_id} pid={pid}")
+
+    # ── Log channel ──
+    try:
+        bot.send_message(LOG_CHANNEL_ID,
+            f"🔄 <b>Renew Successful!</b>\n\n"
+            f"👤 <b>User ID:</b> <code>{mask_id(user_id)}</code>\n"
+            f"📦 <b>Product:</b> Real Proxy\n"
+            f"⏱️ <b>Renew:</b> {label}\n"
+            f"💰 <b>Total:</b> {bdt} BDT\n"
+            f"📅 <b>Date:</b> {renew_date}",
+            parse_mode="HTML")
+    except Exception:
+        pass
+
+    bal_txt = f" ৳{new_balance}" if new_balance is not None else ""
+    _alert(f"✅ {label} এর জন্য রিনিউ হয়েছে।\n💰 কাটা হয়েছে: ৳{bdt}\n💳 নতুন ব্যালেন্স:{bal_txt}",
+           f"✅ Renewed for {label}.\n💰 Charged: ৳{bdt}\n💳 New balance:{bal_txt}")
+    _rp_render_action_menu(call, load_db(), lang, user_id, pid)
 
 
 def finalize_realproxy_migration(call, db, state, lang):
