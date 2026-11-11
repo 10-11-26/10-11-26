@@ -6198,6 +6198,180 @@ def _get_stock_conn():
     raise last_err
 
 
+
+# ═══════════════════════════════════════════════════════════════════════
+# 🛡️ DELIVERED-ITEM LEDGER — একই মেইল/ডেটা ২ জনের কাছে যাওয়া DB লেভেলেই অসম্ভব
+# ═══════════════════════════════════════════════════════════════════════
+# প্রতিটা স্টক row ক্রেতাকে দেওয়ার আগে MySQL এর `bot_delivered_items` টেবিলে
+# PRIMARY KEY (item_hash) দিয়ে "claim" করা হয়। INSERT IGNORE atomic — একই row দ্বিতীয়বার
+# claim করতে গেলে MySQL নিজেই reject করে। ফলে:
+#   • একাধিক bot instance (Railway redeploy overlap) একসাথে চললেও
+#   • restart এ MySQL থেকে পুরনো স্টক ফাইল ফিরে এলেও
+#   • ডেলিভারি "ফেইল" ভেবে row আবার স্টকে ঢুকলেও
+# বিক্রি হয়ে যাওয়া row আর কখনো দ্বিতীয় ক্রেতার কাছে যাবে না (stale row স্টক থেকে বাদ পড়ে)।
+# DB এরর হলে FAIL-CLOSED: কিছু বিক্রি হয় না (ভুল ডেলিভারির চেয়ে বিক্রি বন্ধ ভালো)।
+_ledger_ready = False
+_ledger_init_lock = threading.Lock()
+
+
+def _ledger_ensure():
+    global _ledger_ready
+    if _ledger_ready:
+        return
+    with _ledger_init_lock:
+        if _ledger_ready:
+            return
+        conn = _get_stock_conn()
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bot_delivered_items (
+                    item_hash   CHAR(64) PRIMARY KEY,
+                    product     VARCHAR(191) NOT NULL DEFAULT '',
+                    claim_token CHAR(32)     NOT NULL DEFAULT '',
+                    claimed_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_claim_token (claim_token)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+        _ledger_ready = True
+
+
+def _ledger_row_hash(product_name, cells):
+    """row এর normalized hash — খালি cell বাদ, ছাঁটা, '|' দিয়ে জোড়া (CSV/xlsx/gmail restore সব ফরম্যাটে একই)।"""
+    norm = "|".join(str(c).strip() for c in cells if c is not None and str(c).strip() != "")
+    return _hashlib_stock.sha256(f"{product_name}\x00{norm}".encode("utf-8")).hexdigest()
+
+
+def _ledger_claim(product_name, rows, token):
+    """rows এর প্রতিটা atomically claim করে। রিটার্ন: ([accepted_bool...], [hash...])।
+    accepted=False মানে ওই row আগেই বিক্রি হয়েছে (বা এই ব্যাচেই ডুপ্লিকেট) — দেওয়া যাবে না।"""
+    _ledger_ensure()
+    hashes = [_ledger_row_hash(product_name, r) for r in rows]
+    first_idx = {}
+    for i, h in enumerate(hashes):
+        first_idx.setdefault(h, i)          # একই ব্যাচে একই row দুইবার থাকলে শুধু প্রথমটা
+    uniq = list(first_idx.keys())
+    mine = set()
+    conn = _get_stock_conn()
+    for off in range(0, len(uniq), 400):
+        part = uniq[off:off + 400]
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT IGNORE INTO bot_delivered_items (item_hash, product, claim_token) VALUES (%s,%s,%s)",
+                [(h, product_name[:191], token) for h in part])
+        with conn.cursor() as cur:
+            ph = ",".join(["%s"] * len(part))
+            cur.execute(
+                f"SELECT item_hash FROM bot_delivered_items WHERE claim_token=%s AND item_hash IN ({ph})",
+                [token] + part)
+            mine.update(r[0] for r in cur.fetchall())
+    ok = [(h in mine and first_idx[h] == i) for i, h in enumerate(hashes)]
+    return ok, hashes
+
+
+def _ledger_release_hashes(hashes):
+    """আগে-ডেলিভারি-ফেইলে (কিছুই পাঠানো হয়নি) claim ফেরত দাও।"""
+    hashes = [h for h in (hashes or []) if h]
+    if not hashes:
+        return
+    _ledger_ensure()
+    conn = _get_stock_conn()
+    for off in range(0, len(hashes), 400):
+        part = hashes[off:off + 400]
+        with conn.cursor() as cur:
+            ph = ",".join(["%s"] * len(part))
+            cur.execute(f"DELETE FROM bot_delivered_items WHERE item_hash IN ({ph})", part)
+
+
+def _ledger_release_rows(product_name, rows):
+    try:
+        _ledger_release_hashes([_ledger_row_hash(product_name, r) for r in rows])
+    except Exception as _le:
+        # release ব্যর্থ হলে row ব্লকড থাকে → হারাতে পারে কিন্তু কখনো ডুপ্লিকেট বিক্রি হয় না (safe side)
+        logging.error(f"ledger release failed [{product_name}]: {_le}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 🔒 SINGLE-INSTANCE GUARD — একই সময়ে একটার বেশি bot instance যেন sell না করে
+# ═══════════════════════════════════════════════════════════════════════
+# MySQL GET_LOCK (connection-bound): পুরনো container মরলে lock নিজে ছেড়ে যায়।
+# নতুন instance সর্বোচ্চ _SINGLETON_WAIT_SEC অপেক্ষা করে পুরনোটা বন্ধ হওয়ার জন্য।
+_SINGLETON_LOCK_NAME = "storebot_singleton_v1"
+_SINGLETON_WAIT_SEC = int(os.environ.get("SINGLETON_WAIT_SEC", "120"))
+_singleton_conn = None
+
+
+def _singleton_connect():
+    import ssl as _ssl_sg
+    _ctx = _ssl_sg.create_default_context()
+    _ctx.check_hostname = False
+    _ctx.verify_mode = _ssl_sg.CERT_NONE
+    if _LOCAL_STOCK_URL:
+        host, port, user, pw, db = _STOCK_DB_HOST, _STOCK_DB_PORT, _STOCK_DB_USER, _STOCK_DB_PASS, _STOCK_DB_NAME
+    else:
+        host, port, user, pw, db = _MYSQL_HOST, _MYSQL_PORT, _MYSQL_USER, _MYSQL_PASSWORD, _MYSQL_DATABASE
+    return pymysql.connect(host=host, port=port, user=user, password=pw, database=db,
+                           ssl=_ctx, autocommit=True, charset="utf8mb4",
+                           connect_timeout=10, read_timeout=30, write_timeout=30)
+
+
+def _singleton_try_lock(conn, wait=0):
+    with conn.cursor() as cur:
+        cur.execute("SELECT GET_LOCK(%s, %s)", (_SINGLETON_LOCK_NAME, int(wait)))
+        r = cur.fetchone()
+    return bool(r and r[0] == 1)
+
+
+def _singleton_keepalive():
+    global _singleton_conn
+    import time as _t_sg
+    while True:
+        _t_sg.sleep(20)
+        try:
+            with _singleton_conn.cursor() as cur:
+                cur.execute("SELECT IS_USED_LOCK(%s) = CONNECTION_ID()", (_SINGLETON_LOCK_NAME,))
+                r = cur.fetchone()
+            if not (r and r[0] == 1):
+                if not _singleton_try_lock(_singleton_conn, 0):
+                    logging.error("⚠️ singleton lock হারিয়েছে — অন্য instance চলছে হতে পারে (ledger এখনও ডুপ্লিকেট ঠেকাচ্ছে)")
+        except Exception:
+            try:
+                _mysql_close_quiet(_singleton_conn)
+                _singleton_conn = _singleton_connect()
+                _singleton_try_lock(_singleton_conn, 0)
+            except Exception as _e:
+                logging.error(f"singleton keepalive reconnect failed: {_e}")
+
+
+def singleton_guard_start():
+    """পুরনো instance বন্ধ না হওয়া পর্যন্ত (সর্বোচ্চ _SINGLETON_WAIT_SEC) অপেক্ষা করে; তারপর lock ধরে রাখে।"""
+    global _singleton_conn
+    import time as _t_sg
+    try:
+        _singleton_conn = _singleton_connect()
+        deadline = _t_sg.time() + _SINGLETON_WAIT_SEC
+        warned = False
+        while True:
+            if _singleton_try_lock(_singleton_conn, 5):
+                print("🔒 Single-instance lock পাওয়া গেছে — শুধু এই instance sell করবে")
+                break
+            if not warned:
+                print("⏳ অন্য একটা bot instance এখনও চলছে — সে বন্ধ হওয়া পর্যন্ত অপেক্ষা করছি...")
+                warned = True
+            if _t_sg.time() >= deadline:
+                msg = ("⚠️ Single-instance lock পাওয়া যায়নি — হয়তো একাধিক bot instance চলছে "
+                       "(Railway replicas / লোকাল টেস্ট)। ডুপ্লিকেট ডেলিভারি ledger দিয়ে ঠেকানো আছে, "
+                       "তবু একটার বেশি instance চালাবেন না।")
+                logging.error(msg)
+                try:
+                    bot.send_message(ADMIN_ID, msg)
+                except Exception:
+                    pass
+                break
+        threading.Thread(target=_singleton_keepalive, daemon=True, name="singleton_keepalive").start()
+    except Exception as _e:
+        logging.error(f"singleton_guard_start error (ledger তবু সক্রিয়): {_e}")
+
+
 _STOCK_SYNC_INTERVAL = 2.0
 _stock_sync_wake     = threading.Event()
 _stock_sync_pass_lock = threading.Lock()
@@ -6214,6 +6388,10 @@ def _stock_sync_kick():
 
 
 def _stock_sync_init_table():
+    try:
+        _ledger_ensure()
+    except Exception as _le0:
+        logging.error(f"ledger init error: {_le0}")
     conn = _get_stock_conn()
     with conn.cursor() as cur:
         cur.execute("""
@@ -12130,34 +12308,87 @@ def read_stock_file(product_name, quantity):
         ws = wb.active
 
         header_raw = None
-        collected_rows = []     # delivered (plain text)
-        remaining_rows = []     # stock এ থেকে যাবে (plain text, খালি row বাদ)
+        pool = []               # ফাইলের সব data row (plain text, খালি row বাদ)
         for ri, row in enumerate(ws.iter_rows(values_only=True), start=1):
             if ri == 1:
                 header_raw = list(row)
                 continue
             if not any(c is not None and str(c).strip() != "" for c in row):
                 continue
-            if len(collected_rows) < quantity:
-                collected_rows.append([_stock_plain_value(c) for c in row])
-            else:
-                remaining_rows.append([_stock_plain_value(c) for c in row])
+            pool.append([_stock_plain_value(c) for c in row])
         wb.close()
 
-        if header_raw is None or not collected_rows:
+        if header_raw is None or not pool:
             return None
         header_data = [_stock_plain_value(c) for c in header_raw]
 
+        # 🛡️ LEDGER CLAIM — প্রতিটা row ডেলিভারির আগে MySQL এ atomically claim করা হয়।
+        # আগেই বিক্রি হওয়া (stale) row এখানে ধরা পড়ে এবং স্টক থেকে বাদ যায় — কখনো ক্রেতাকে যায় না।
+        # DB এরর হলে exception → নিচের except এ None রিটার্ন (ফাইল অপরিবর্তিত, কিছু বিক্রি হয় না)।
+        _claim_token = uuid.uuid4().hex
+        collected_rows = []     # delivered (plain text)
+        claimed_hashes = []
+        dropped_stale = 0
+        idx = 0
+        try:
+            while len(collected_rows) < quantity and idx < len(pool):
+                need = quantity - len(collected_rows)
+                chunk = pool[idx: idx + need]
+                idx += len(chunk)
+                ok_flags, hashes_ = _ledger_claim(product_name, chunk, _claim_token)
+                for _r, _ok, _h in zip(chunk, ok_flags, hashes_):
+                    if _ok:
+                        collected_rows.append(_r)
+                        claimed_hashes.append(_h)
+                    else:
+                        dropped_stale += 1
+        except Exception:
+            try:
+                _ledger_release_hashes(claimed_hashes)
+            except Exception:
+                pass
+            raise
+
+        if dropped_stale:
+            logging.warning(f"🛡️ LEDGER: {product_name} এ {dropped_stale}টা আগে-বিক্রি-হওয়া row ধরা পড়েছে — স্টক থেকে বাদ দেওয়া হলো (ডুপ্লিকেট ডেলিভারি ঠেকানো গেছে)")
+
+        remaining_rows = pool[idx:]      # স্টক এ থেকে যাবে
+
+        if len(collected_rows) < quantity:
+            # যথেষ্ট fresh row নেই — claim ফেরত দাও, শুধু stale row বাদ দিয়ে ফাইল ঠিক করো, ডেলিভারি করো না
+            try:
+                _ledger_release_hashes(claimed_hashes)
+            except Exception:
+                pass
+            if dropped_stale:
+                _tmp_fix = path + ".tmp"
+                _wb_fix = openpyxl.Workbook(write_only=True)
+                _ws_fix = _wb_fix.create_sheet(title="Sheet1")
+                _ws_fix.append(header_data)
+                for _r in collected_rows + remaining_rows:
+                    _ws_fix.append(_r)
+                _wb_fix.save(_tmp_fix)
+                _wb_fix.close()
+                os.replace(_tmp_fix, path)
+                _local_count_prime(product_name, len(collected_rows) + len(remaining_rows))
+                invalidate_stock_cache(product_name)
+            return None
+
         # বাকি stock নতুন ফাইলে একবারে লিখে atomic replace
         tmp_path = path + ".tmp"
-        out_wb = openpyxl.Workbook(write_only=True)
-        out_ws = out_wb.create_sheet(title="Sheet1")
-        out_ws.append(header_data)
-        for r in remaining_rows:
-            out_ws.append(r)
-        out_wb.save(tmp_path)
-        out_wb.close()
-        os.replace(tmp_path, path)
+        try:
+            out_wb = openpyxl.Workbook(write_only=True)
+            out_ws = out_wb.create_sheet(title="Sheet1")
+            out_ws.append(header_data)
+            for r in remaining_rows:
+                out_ws.append(r)
+            out_wb.save(tmp_path)
+            out_wb.close()
+            os.replace(tmp_path, path)
+        except Exception:
+            # ফাইল লেখা ব্যর্থ — কিছু দেওয়া হয়নি, তাই claim ফেরত দাও
+            _ledger_release_rows(product_name, collected_rows)
+            raise
         _local_count_prime(product_name, len(remaining_rows))   # ⚡ বিক্রির পরের স্টক সাথে সাথে জানা
         # 🔒 বিক্রি হওয়া row বাদ দেওয়া নতুন স্টক ফাইল MySQL এ *এখনই* সেভ করো (ক্রেতাকে দেওয়ার আগে)।
         # নইলে সেভ হওয়ার আগেই bot kill/redeploy হলে restart এ পুরনো ফাইল ফিরে আসত →
@@ -12203,6 +12434,9 @@ def _restore_stock_file(product_name, csv_stream):
             return
         header    = reader[0]
         data_rows = reader[1:]
+        # 🛡️ শুধু "কিছুই পাঠানো হয়নি" এমন ক্ষেত্রেই এই ফাংশন ডাকা উচিত — এই row গুলো আবার বিক্রি
+        # করা যাবে, তাই ledger থেকে claim ছেড়ে দাও (নইলে stale ভেবে বাদ পড়ত)।
+        _ledger_release_rows(product_name, data_rows)
 
         existing = []
         if os.path.exists(path):
@@ -20995,6 +21229,22 @@ def process_purchase(user_id, product_name, quantity, price, total_price, displa
 
                 # ── আগে file/account deliver করো ──
                 delivery_ok = False
+                # 🛡️ _send_started=True হওয়ার পর মেইল আর কখনো স্টকে ফেরত যাবে না
+                # (Telegram timeout হলেও মেসেজ আসলে পৌঁছে যেতে পারে → ফেরত দিলে ২য় ক্রেতাও পেত)
+                _send_started = False
+
+                def _send_retry(_fn, _tries=3):
+                    _last = None
+                    for _i in range(_tries):
+                        try:
+                            return _fn()
+                        except Exception as _se:
+                            _last = _se
+                            _code = getattr(_se, "error_code", None)
+                            if _code in (400, 403):      # blocked/bad request — retry করে লাভ নেই
+                                break
+                            _time_module.sleep(1.5 * (_i + 1))
+                    raise _last
 
                 if quantity == 1:
                     try:
@@ -21101,21 +21351,36 @@ def process_purchase(user_id, product_name, quantity, price, total_price, displa
                                 account_msg = _proxy_delivery_msg(*_proxy_parsed)
                             # ① আগে purchase success
                             new_balance = round(current_balance - total_price, 2)
-                            bot.send_message(user_id,
-                                t(user_id, "purchase_success",
+                            _ok_text = t(user_id, "purchase_success",
                                   order_id=order_id, product=show_name, qty=quantity,
-                                  price=price, total=total_price, bal=new_balance, date=current_time, usd=with_usd_equiv(user_id, new_balance)),
-                                parse_mode="HTML")
-                            # ② তারপর account details + buy menu
+                                  price=price, total=total_price, bal=new_balance, date=current_time, usd=with_usd_equiv(user_id, new_balance))
+                            try:
+                                _buy_kb = get_product_buy_keyboard(user_id, product_name)
+                            except Exception:
+                                _buy_kb = get_main_menu(user_id)
                             _remember_last_account_from_dict(user_id, account_dict, product=show_name, order_id=order_id)
-                            bot.send_message(user_id, account_msg, parse_mode="HTML",
-                                reply_markup=get_product_buy_keyboard(user_id, product_name))
+                            _send_started = True      # ← এখান থেকে আর restore নয়
+                            _send_retry(lambda: bot.send_message(user_id, _ok_text, parse_mode="HTML"))
+                            # ② তারপর account details + buy menu
+                            try:
+                                _send_retry(lambda: bot.send_message(user_id, account_msg, parse_mode="HTML",
+                                    reply_markup=_buy_kb))
+                            except Exception as _fmt_e:
+                                if getattr(_fmt_e, "error_code", None) == 400:
+                                    # HTML parse সমস্যা হলে plain text এ পাঠাও
+                                    _plain = "📬 Account Details:\n\n" + "\n".join(
+                                        f"{k}: {v}" for k, v in account_dict.items() if str(v).strip()
+                                    ) + f"\n\n🆔 Order: {order_id}"
+                                    _send_retry(lambda: bot.send_message(user_id, _plain, reply_markup=_buy_kb))
+                                else:
+                                    raise
                             delivery_ok = True
                         else:
                             bot.send_message(user_id, t(user_id, "file_error"), parse_mode="HTML")
                     except Exception as e:
                         logging.error(f"Single account text send error: {e}")
-                        bot.send_message(user_id, t(user_id, "file_error"), parse_mode="HTML")
+                        if not _send_started:
+                            bot.send_message(user_id, t(user_id, "file_error"), parse_mode="HTML")
                 else:
                     try:
                         file_name = f"{show_name.replace(' ', '_').replace('/', '-')}_{order_id}.csv"
@@ -21128,22 +21393,58 @@ def process_purchase(user_id, product_name, quantity, price, total_price, displa
                             f"⚠️ <i>Please save this file!</i>"
                         )
                         new_balance = round(current_balance - total_price, 2)
-                        # ① আগে purchase success
-                        bot.send_message(user_id,
-                            t(user_id, "purchase_success",
+                        _ok_text_b = t(user_id, "purchase_success",
                               order_id=order_id, product=show_name, qty=quantity,
-                              price=price, total=total_price, bal=new_balance, date=current_time, usd=with_usd_equiv(user_id, new_balance)),
-                            parse_mode="HTML")
-                        # ② তারপর file + buy menu
-                        bot.send_document(user_id, stock_file, caption=caption, parse_mode="HTML",
-                            reply_markup=get_product_buy_keyboard(user_id, product_name))
+                              price=price, total=total_price, bal=new_balance, date=current_time, usd=with_usd_equiv(user_id, new_balance))
+                        try:
+                            _buy_kb_b = get_product_buy_keyboard(user_id, product_name)
+                        except Exception:
+                            _buy_kb_b = get_main_menu(user_id)
+                        _send_started = True      # ← এখান থেকে আর restore নয়
+                        # ① আগে purchase success
+                        _send_retry(lambda: bot.send_message(user_id, _ok_text_b, parse_mode="HTML"))
+                        # ② তারপর file + buy menu (প্রতিবার stream শুরু থেকে)
+                        def _do_send_doc():
+                            stock_file.seek(0)
+                            return bot.send_document(user_id, stock_file, caption=caption, parse_mode="HTML",
+                                reply_markup=_buy_kb_b)
+                        _send_retry(_do_send_doc)
                         delivery_ok = True
                     except Exception as e:
                         logging.error(f"File send error: {e}")
-                        bot.send_message(user_id, t(user_id, "file_error"), parse_mode="HTML")
+                        if not _send_started:
+                            bot.send_message(user_id, t(user_id, "file_error"), parse_mode="HTML")
+
+                if not delivery_ok and _send_started:
+                    # 🛡️ পাঠানো শুরু হয়ে গেছে কিন্তু নিশ্চিত হওয়া যায়নি — মেইল কখনোই স্টকে ফেরত যাবে না
+                    # (নইলে ক্রেতা পেয়ে থাকলে ২য় ক্রেতাও পেত)। balance কাটা হয়নি; admin কে ডেটাসহ জানানো হচ্ছে।
+                    try:
+                        stock_file.seek(0)
+                        _lost = stock_file.read().decode("utf-8-sig", errors="replace")
+                    except Exception:
+                        _lost = "(read failed)"
+                    logging.error(f"DELIVERY UNCONFIRMED (not restored) order={order_id} user={user_id} product={product_name}")
+                    try:
+                        bot.send_message(ADMIN_ID,
+                            f"⚠️ <b>Delivery Unconfirmed</b>\n"
+                            f"User: <code>{user_id}</code>\nOrder: <code>{order_id}</code>\n"
+                            f"Product: {_hx(show_name)} × {quantity}\n\n"
+                            f"মেইল স্টকে ফেরত দেওয়া <b>হয়নি</b> (ডুপ্লিকেট ঠেকাতে)। ইউজার না পেয়ে থাকলে ম্যানুয়ালি দিন:\n"
+                            f"<code>{_hx(_lost[:3500])}</code>",
+                            parse_mode="HTML")
+                    except Exception:
+                        pass
+                    try:
+                        bot.send_message(user_id,
+                            f"⚠️ <b>ডেলিভারি নিশ্চিত হয়নি।</b>\n\n🆔 Order: <code>{order_id}</code>\n"
+                            f"আপনার balance কাটা হয়নি। দয়া করে সাপোর্টে যোগাযোগ করুন: @{SUPPORT_USERNAME}",
+                            parse_mode="HTML", reply_markup=get_main_menu(user_id))
+                    except Exception:
+                        pass
+                    return
 
                 if not delivery_ok:
-                    # Delivery ব্যর্থ — stock ফেরত দাও, balance কাটবো না
+                    # Delivery ব্যর্থ (পাঠানোর আগেই — কিছুই যায়নি) — stock ফেরত দাও, balance কাটবো না
                     try:
                         _restore_stock_file(product_name, stock_file)
                     except Exception as re:
@@ -35313,6 +35614,9 @@ if __name__ == "__main__":
     print(f"📦 Stock Cache TTL: {_STOCK_CACHE_TTL}s")
     print(f"⚡ Callback ACK: INSTANT (pre-answer + thread pool)")
     print("=" * 60)
+
+    # 🔒 একাধিক instance একসাথে sell করা ঠেকাও (পুরনো container বন্ধ হওয়া পর্যন্ত অপেক্ষা)
+    singleton_guard_start()
 
     # 💾 লোকাল স্টক MySQL থেকে restore + auto-sync চালু (সবার আগে)
     stock_sync_start()
