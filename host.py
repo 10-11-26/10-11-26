@@ -1532,6 +1532,7 @@ BOT_SETTING_FIELDS = {
     "livechat":  {"db_key": "livechat_username",  "label": "✅ Live Chat Username", "kind": "username"},
     "binance": {"db_key": "binance_id",       "label": "🔵 Binance ID",       "kind": "binance"},
     "binancepay": {"db_key": "binance_pay_uid", "label": "💳 Binance Pay ID",  "kind": "binance"},
+    "otpsite": {"db_key": "otp_site_url",     "label": "🌐 OTP Site Link",    "kind": "link"},
 }
 
 def apply_bot_settings_overrides(db=None):
@@ -1581,6 +1582,19 @@ def is_maintenance_mode(db=None):
         return bool(v)
     except Exception:
         return False  # DB সমস্যা হলে বট বন্ধ করে দিও না (fail-open)
+
+def get_otp_site_url(db=None):
+    """💻 Code বাটনের প্রম্পটে দেখানো OTP SITE লিংক (Bot Settings → 🌐 OTP Site Link)।
+    সেট না থাকলে/খালি হলে খালি স্ট্রিং — তখন প্রম্পটে OTP SITE লাইনটাই দেখানো হয় না।"""
+    try:
+        if db is None:
+            db = load_db()
+        v = (db.get("settings", {}) or {}).get("otp_site_url")
+        v = str(v).strip() if v else ""
+        return v if re.match(r"(?i)^https?://\S+$", v) else ""
+    except Exception:
+        return ""
+
 
 def set_bot_setting(db_key, value):
     """settings/<db_key> এ মান সেভ করে (cache + MySQL) এবং গ্লোবাল sync করে।"""
@@ -12418,6 +12432,52 @@ def read_stock_file(product_name, quantity):
         logging.error(f"Stock file read error: {str(e)}\n{traceback.format_exc()}")
         return None
 
+def read_stock_file_shared(product_name, quantity):
+    """
+    🛡️ VPN (All VPN) প্রোডাক্টের জন্য: stock ফাইল থেকে কিছু মোছে না, ledger claim নেই।
+    একই row একাধিক ক্রেতা পেতে পারে (VPN ডেটা শেয়ার্ড — এটাই ইচ্ছিত)।
+    CSV BytesIO return করে (read_stock_file এর মতোই format), না থাকলে None।
+    """
+    import csv as _csv
+    path = os.path.join(STOCK_DIR, f"{product_name}.xlsx")
+    try:
+        if not os.path.exists(path):
+            return None
+        quantity = int(quantity)
+        wb = openpyxl.load_workbook(path, read_only=True)
+        ws = wb.active
+        header_raw = None
+        pool = []
+        for ri, row in enumerate(ws.iter_rows(values_only=True), start=1):
+            if ri == 1:
+                header_raw = list(row)
+                continue
+            if not any(c is not None and str(c).strip() != "" for c in row):
+                continue
+            pool.append([_stock_plain_value(c) for c in row])
+        wb.close()
+
+        if header_raw is None or not pool or len(pool) < quantity:
+            return None
+        header_data = [_stock_plain_value(c) for c in header_raw]
+        picked = pool[:quantity]
+
+        import io as _io
+        text_stream = _io.StringIO()
+        writer = _csv.writer(text_stream, lineterminator="\n")
+        writer.writerow(header_data)
+        n_cols = len(header_data)
+        for row in picked:
+            padded = (list(row) + [""] * max(0, n_cols - len(row)))[:n_cols]
+            writer.writerow(padded)
+
+        stream = BytesIO(text_stream.getvalue().encode("utf-8"))
+        stream.seek(0)
+        return stream
+    except Exception as e:
+        logging.error(f"Shared stock read error [{product_name}]: {str(e)}\n{traceback.format_exc()}")
+        return None
+
 def _restore_stock_file(product_name, csv_stream):
     """
     Delivery ব্যর্থ হলে read_stock_file এ মুছে যাওয়া rows
@@ -18311,32 +18371,490 @@ def get_product_buy_keyboard(user_id, product_name=None):
     _back_row(markup, user_id, product_name)
     return markup
 
-# ── MailGen /api/inbox-read — Hotmail/Outlook inbox (email|password|refresh_token|client_id) ──
-def mailgen_inbox_read(full_data, message_count=20):
-    """mailgen.shop POST /api/inbox-read। রিটার্ন: (data, error)।"""
-    try:
-        headers = {"Content-Type": "application/json"}
-        if MAILGEN_API_KEY:
-            headers["X-API-Key"] = MAILGEN_API_KEY
-        resp = http_requests.post(
-            f"{MAILGEN_BASE_URL}/api/inbox-read",
-            json={"emailData": full_data, "messageCount": message_count},
-            headers=headers, timeout=30)
+# ═══════════════════════════════════════════════════════════
+# 📮 MAILGEN CORE CLIENT (mailgen.shop) — v5.4
+# ───────────────────────────────────────────────────────────
+# • tools.dongvanfb.net সম্পূর্ণ বাদ — Get OTP, /code, /tn_verify সব এখান দিয়ে চলে
+# • একটাই connection-pool (Session) — প্রতি রিকোয়েস্টে নতুন TLS handshake নেই
+# • (connect, read) timeout + মোট deadline — কখনো ঝুলে থাকবে না
+# • 429 / 5xx / timeout / network এ exponential backoff + retry (Retry-After মানে)
+# • একসাথে সর্বোচ্চ MG_MAX_CONCURRENT রিকোয়েস্ট (semaphore) — সার্ভার overload নেই
+# • একই মেইলবক্সে একসাথে অনেক রিকোয়েস্ট এলে একটাই যায় (coalescing)
+# • টানা ব্যর্থতায় circuit-breaker — MG_BREAKER_COOLDOWN সেকেন্ড রিকোয়েস্ট বন্ধ
+# • প্রাইমারি: POST /api/get-inbox (mode=oauth → graph); fallback: POST /api/inbox-read
+#   fallback শুধু দরকারে (error হলে / প্রথম রাউন্ডে ইনবক্স খালি হলে) — প্রতি পোলে ৩টা কল নয়
+# • লগে কখনো full_data (password/refresh_token) যায় না
+# ═══════════════════════════════════════════════════════════
+import hashlib as _mg_hashlib
+import random as _mg_random
+from requests.adapters import HTTPAdapter as _MgHTTPAdapter
+
+MAILGEN_AUTH_HEADER = os.environ.get('MAILGEN_AUTH_HEADER', 'X-API-Key')
+MG_CONNECT_TIMEOUT  = 5      # সেকেন্ড — সংযোগ স্থাপন
+MG_READ_TIMEOUT     = 20     # সেকেন্ড — একটা রিকোয়েস্টের উত্তর (Outlook থেকে পড়তে সময় লাগে)
+MG_MAX_RETRIES      = 2      # প্রতি কলে সর্বোচ্চ ৩ বার চেষ্টা (১ + ২ retry)
+MG_MAX_CONCURRENT   = 6      # একসাথে সর্বোচ্চ কয়টা Mailgen রিকোয়েস্ট
+MG_ACQUIRE_TIMEOUT  = 8      # slot না পেলে কত সেকেন্ড অপেক্ষা
+MG_REUSE_SEC        = 1.0    # একই মেইলবক্সের ১ সেকেন্ডের মধ্যের সফল ফলাফল পুনর্ব্যবহার (পোল দ্রুত হওয়ায় কমানো)
+MG_BREAKER_FAILS    = 5      # টানা এতবার ব্যর্থ হলে breaker খোলে
+MG_BREAKER_COOLDOWN = 20     # breaker খোলা থাকার সময় (সেকেন্ড)
+MG_RETRY_AFTER_CAP  = 5      # Retry-After যত বড়ই হোক, এর বেশি ঘুমাবে না
+MG_FINAL_GRACE      = 12     # polling window শেষের পর চলমান রিকোয়েস্টের অতিরিক্ত সময়
+
+_mg_session = http_requests.Session()
+_mg_session.mount("https://", _MgHTTPAdapter(pool_connections=4, pool_maxsize=16, max_retries=0))
+_mg_session.mount("http://",  _MgHTTPAdapter(pool_connections=4, pool_maxsize=16, max_retries=0))
+_mg_sem = threading.BoundedSemaphore(MG_MAX_CONCURRENT)
+_mg_state_lock = threading.Lock()
+_mg_breaker = {"fails": 0, "open_until": 0.0}
+_mg_key_locks = {}       # mailbox-key → Lock (coalescing)
+_mg_last = {}            # mailbox-key → (ts, msgs, err, kind)
+_mg_mode_pref = {}       # email → যে mode এ (oauth/graph) শেষবার মেসেজ পাওয়া গেছে
+_mg_alert_last = {}      # অ্যাডমিন অ্যালার্ট dedupe
+
+# ইউজারের টোকেন/অ্যাকাউন্ট সমস্যা (বারবার চেষ্টা করে লাভ নেই) — শুধু সুনির্দিষ্ট শব্দ
+_MG_CRED_RE = re.compile(
+    r"invalid[_ ]grant|invalid[_ ]client|invalid[_ ]token|token.{0,30}(expired|revoked|invalid)|"
+    r"wrong password|login failed|AADSTS|refresh.?token|"
+    r"account.{0,20}(locked|disabled|suspended|blocked)", re.I)
+# আমাদের নিজের Mailgen API key সমস্যা
+_MG_APIKEY_RE = re.compile(r"api[\s_-]?key|x-api-key|invalid key|missing key", re.I)
+
+
+def _mg_url(path):
+    return f"{MAILGEN_BASE_URL}{path}"
+
+
+def _mg_key(full_data):
+    """মেইলবক্সের পরিচয় — সম্পূর্ণ credential এর hash, তাই দুই আলাদা মেইলের ফলাফল কখনো মেশে না।"""
+    return _mg_hashlib.sha1((full_data or "").encode("utf-8", "ignore")).hexdigest()[:16]
+
+
+def _mg_mask(email):
+    e = str(email or "")
+    if "@" not in e:
+        return "***"
+    u, d = e.split("@", 1)
+    return (u[:2] + "***@" + d)
+
+
+def _mg_classify_error(status, text):
+    """error টেক্সট/স্ট্যাটাস থেকে kind: apikey | cred | client
+    • টেক্সটে API-key উল্লেখ → apikey
+    • টেক্সটে টোকেন সমস্যার সুনির্দিষ্ট শব্দ (invalid_grant ইত্যাদি) → cred
+    • শুধু HTTP 401/403 (সাধারণ 'Unauthorized') → আমাদের API key সমস্যা (key নেই/ভুল) → apikey
+    • বাকি 4xx → client (ভুল ফরম্যাট ইত্যাদি)"""
+    text = str(text or "")
+    if _MG_APIKEY_RE.search(text):
+        return "apikey"
+    if _MG_CRED_RE.search(text):
+        return "cred"
+    if status in (401, 403):
+        return "apikey"
+    return "client"
+
+
+def _mg_breaker_open():
+    with _mg_state_lock:
+        return _time_module.time() < _mg_breaker["open_until"]
+
+
+def _mg_breaker_record(ok):
+    """ok=True → রিসেট; ok=False → টানা ব্যর্থতা গোনো।"""
+    with _mg_state_lock:
+        if ok:
+            _mg_breaker["fails"] = 0
+            return
+        _mg_breaker["fails"] += 1
+        if _mg_breaker["fails"] >= MG_BREAKER_FAILS:
+            _mg_breaker["open_until"] = _time_module.time() + MG_BREAKER_COOLDOWN
+            # half-open: cooldown শেষে একটা ব্যর্থতাতেই আবার খুলবে
+            _mg_breaker["fails"] = MG_BREAKER_FAILS - 1
+            logging.warning(f"Mailgen circuit-breaker OPEN for {MG_BREAKER_COOLDOWN}s")
+
+
+def _mg_post(path, payload, deadline=None):
+    """একটা Mailgen POST — retry/backoff/deadline/breaker সহ। কখনো exception ছোঁড়ে না।
+    রিটার্ন: (data, err, kind)
+      kind: ok | apikey | cred | client | rate | server | timeout | network | bad | breaker | busy"""
+    if _mg_breaker_open():
+        return None, "Mailgen সাময়িকভাবে বন্ধ (বারবার ব্যর্থ) — একটু পরে চেষ্টা করুন", "breaker"
+    headers = {"Content-Type": "application/json"}
+    if MAILGEN_API_KEY:
+        headers[MAILGEN_AUTH_HEADER] = MAILGEN_API_KEY
+    last_err, last_kind = "unknown", "network"
+    for attempt in range(MG_MAX_RETRIES + 1):
+        now = _time_module.time()
+        remaining = (deadline - now) if deadline else float(MG_READ_TIMEOUT)
+        if remaining < 1.5:
+            if attempt == 0:        # আমাদের নিজের deadline — সার্ভারের দোষ নয়, breaker এ গোনা হবে না
+                return None, "সময় শেষ", "timeout"
+            break
+        read_to = min(float(MG_READ_TIMEOUT), remaining)
+        retry_after = None
+        got_slot = _mg_sem.acquire(timeout=min(MG_ACQUIRE_TIMEOUT, max(0.5, remaining - 1)))
+        if not got_slot:
+            return None, "Mailgen রিকোয়েস্ট ব্যস্ত", "busy"
         try:
-            data = resp.json()
-        except Exception:
-            logging.warning(f"mailgen_inbox_read non-JSON: {resp.status_code} {resp.text[:300]}")
-            return None, "Server থেকে সঠিক response আসেনি। পরে আবার চেষ্টা করুন।"
-        if not resp.ok:
-            return None, data.get("error") or f"API error (status {resp.status_code})"
-        if data.get("error") or data.get("success") is False or data.get("status") not in (None, "SUCCESS"):
-            return None, str(data.get("error") or data.get("status") or "Unknown error")
-        return data, None
-    except http_requests.exceptions.Timeout:
-        return None, "Request timeout হয়ে গেছে। পরে আবার চেষ্টা করুন।"
-    except Exception as e:
-        logging.error(f"mailgen_inbox_read error: {e}")
-        return None, str(e)
+            try:
+                resp = _mg_session.post(_mg_url(path), json=payload, headers=headers,
+                                        timeout=(min(float(MG_CONNECT_TIMEOUT), read_to), read_to))
+            except http_requests.exceptions.Timeout:
+                last_err, last_kind = "timeout", "timeout"
+                resp = None
+            except http_requests.exceptions.RequestException as e:
+                last_err, last_kind = f"network: {type(e).__name__}", "network"
+                resp = None
+        finally:
+            _mg_sem.release()
+
+        if resp is not None:
+            try:
+                data = resp.json()
+            except Exception:
+                data = None
+            body_txt = ""
+            if isinstance(data, dict):
+                body_txt = str(data.get("error") or data.get("message") or "")
+            sc = resp.status_code
+            if sc == 429:
+                ra = None
+                try:
+                    ra = float(resp.headers.get("Retry-After") or (data or {}).get("retry_after") or 0) or None
+                except Exception:
+                    ra = None
+                retry_after = ra
+                last_err, last_kind = "rate limit (429)", "rate"
+            elif sc >= 500:
+                last_err, last_kind = f"server error (HTTP {sc})", "server"
+            elif data is None:
+                last_err, last_kind = f"non-JSON (HTTP {sc})", "bad"
+                logging.warning(f"mailgen {path} non-JSON: HTTP {sc} {resp.text[:120]!r}")
+            elif not resp.ok:
+                err = body_txt or f"API error (HTTP {sc})"
+                _mg_breaker_record(True)          # সার্ভার ঠিকই উত্তর দিয়েছে
+                return None, err, _mg_classify_error(sc, err)
+            elif isinstance(data, dict) and (data.get("error") or data.get("success") is False):
+                err = body_txt or "Unknown error"
+                _mg_breaker_record(True)
+                return None, err, _mg_classify_error(sc, err)
+            else:
+                _mg_breaker_record(True)
+                return data, None, "ok"
+
+        # এখানে পৌঁছালে retry-যোগ্য ব্যর্থতা
+        if attempt < MG_MAX_RETRIES:
+            backoff = retry_after if retry_after else (0.7 * (2 ** attempt) + _mg_random.uniform(0, 0.4))
+            backoff = min(backoff, MG_RETRY_AFTER_CAP)
+            if deadline:
+                backoff = min(backoff, max(0.0, deadline - _time_module.time() - 1.5))
+            if backoff > 0:
+                _time_module.sleep(backoff)
+    if last_kind != "rate":
+        _mg_breaker_record(False)
+    logging.warning(f"mailgen {path} failed: {last_kind} ({last_err})")
+    return None, last_err, last_kind
+
+
+# ── মেসেজ normalize — get-inbox ও inbox-read দুটোর ফরম্যাট একই আকারে ──
+def _mg_addr(v):
+    if isinstance(v, (list, tuple)):
+        return ", ".join(x for x in (_mg_addr(i) for i in v) if x)
+    if isinstance(v, dict):
+        name = str(v.get("name") or "").strip()
+        addr = str(v.get("address") or v.get("email") or "").strip()
+        return f"{name} <{addr}>" if (name and addr) else (name or addr)
+    return str(v or "").strip()
+
+
+def _mg_norm_one(raw):
+    if not isinstance(raw, dict):
+        return None
+    if "_ts" in raw:            # আগেই normalize করা
+        return raw
+    body_keys = ("message", "body", "html", "html_body", "content", "text")
+    parts = [str(raw.get(k)) for k in body_keys if raw.get(k)]
+    body = " ".join(parts)
+    date_raw = raw.get("date") or raw.get("receivedDateTime") or raw.get("received") or raw.get("timestamp") or ""
+    prev = raw.get("preview")
+    return {
+        "id":      str(raw.get("id") or raw.get("messageId") or ""),
+        "subject": str(raw.get("subject") or raw.get("title") or ""),
+        "from":    _mg_addr(raw.get("from") or raw.get("sender") or ""),
+        "to":      _mg_addr(raw.get("to") or raw.get("recipients") or ""),
+        "date":    str(date_raw),
+        "code":    str(raw.get("code") or "").strip(),
+        "_ts":     _otp_parse_ts(date_raw),
+        "message": body,                                    # লিংক খোঁজার জন্য raw HTML সহ
+        "preview": str(prev) if prev else _strip_html(body)[:300],
+    }
+
+
+def _mg_norm_list(raw_list):
+    out = []
+    for r in raw_list if isinstance(raw_list, list) else []:
+        n = _mg_norm_one(r)
+        if n is not None:
+            out.append(n)
+    # নতুন আগে — শুধু যখন সব মেসেজের তারিখ নির্ভরযোগ্যভাবে পার্স হয়; নাহলে API এর ক্রম (নতুন আগে) ধরা হয়
+    if out and all(m.get("_ts") for m in out):
+        out.sort(key=lambda m: m["_ts"], reverse=True)
+    return out
+
+
+def _mg_get_inbox(full_data, mode, deadline=None):
+    """POST /api/get-inbox (mode: oauth | graph)। রিটার্ন: (normalized_msgs, err, kind)।
+    কেনা ডেটা email|password|refresh_token|client_id  →  API ফরম্যাট email|refresh_token|client_id|client_secret"""
+    parts = [x.strip() for x in (full_data or "").split("|")]
+    if len(parts) < 4:
+        return [], "token/client_id নেই", "client"
+    oauth_data = f"{parts[0]}|{parts[2]}|{parts[3]}|" + (parts[4] if len(parts) > 4 else "")
+    data, err, kind = _mg_post("/api/get-inbox", {"data": oauth_data, "mode": mode}, deadline)
+    if err:
+        return [], err, kind
+    raw = data.get("messages") if isinstance(data, dict) else data
+    msgs = _mg_norm_list(raw or [])
+    logging.info(f"mailgen get-inbox[{mode}] {_mg_mask(parts[0])} → {len(msgs)} msgs")
+    return msgs, None, "ok"
+
+
+def mailgen_inbox_read(full_data, message_count=20, deadline=None):
+    """mailgen.shop POST /api/inbox-read (email|password|refresh_token|client_id)।
+    রিটার্ন: (data, error) — আগের মতোই।"""
+    data, err, kind = _mg_post("/api/inbox-read",
+                               {"emailData": full_data, "messageCount": message_count}, deadline)
+    if err:
+        return None, err
+    if isinstance(data, dict) and data.get("status") not in (None, "SUCCESS", True):
+        return None, str(data.get("status") or "Unknown error")
+    return data, None
+
+
+def _mg_inbox_read_msgs(full_data, deadline=None):
+    data, err = mailgen_inbox_read(full_data, deadline=deadline)
+    if err:
+        return [], err
+    return _mg_norm_list((data or {}).get("messages") or []), None
+
+
+def _mg_get_lock(key):
+    with _mg_state_lock:
+        lk = _mg_key_locks.get(key)
+        if lk is None:
+            lk = _mg_key_locks[key] = threading.Lock()
+        return lk
+
+
+def _mg_prune():
+    now = _time_module.time()
+    with _mg_state_lock:
+        if len(_mg_last) > 200:
+            for k in [k for k, v in _mg_last.items() if now - v[0] > 120]:
+                _mg_last.pop(k, None)
+                _mg_key_locks.pop(k, None)
+        if len(_mg_mode_pref) > 2000:
+            _mg_mode_pref.clear()
+
+
+_mg_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="mg")
+
+
+def _mg_get_inbox_m(full_data, mode, deadline=None):
+    m, e, k = _mg_get_inbox(full_data, mode, deadline)
+    return m, e, k, mode
+
+
+def _mg_inbox_read_m(full_data, deadline=None):
+    m, e = _mg_inbox_read_msgs(full_data, deadline)
+    return m, e, ("ok" if not e else "client"), "inbox-read"
+
+
+def _mg_race(fns):
+    """⚡ কয়েকটা কল একসাথে চালায়। প্রথম যেটা মেসেজ নিয়ে ফেরে সেটাই (result, all_results) হিসেবে
+    রিটার্ন হয়; কেউ না পেলে (None, all_results)। বাকি কলগুলো ব্যাকগ্রাউন্ডে শেষ হয়ে যায়।"""
+    from concurrent.futures import wait as _cf_wait, FIRST_COMPLETED as _CF_FIRST
+    pending = {_mg_pool.submit(f) for f in fns}
+    results = []
+    while pending:
+        done, pending = _cf_wait(pending, return_when=_CF_FIRST)
+        for d in done:
+            try:
+                r = d.result()
+            except Exception as e:
+                r = ([], f"network: {type(e).__name__}", "network", "?")
+            results.append(r)
+            if r[0]:
+                return r, results
+    return None, results
+
+
+def _mg_prewarm():
+    """⚡ ইউজার token লিখতে লিখতেই Mailgen এর সাথে TLS connection আগে থেকে খুলে রাখে।"""
+    try:
+        _mg_session.head(MAILGEN_BASE_URL, timeout=(3, 3))
+    except Exception:
+        pass
+
+
+def mailgen_fetch_messages(full_data, deep=False, deadline=None):
+    """একটা মেইলবক্সের ইনবক্স আনে (normalized, নতুন আগে)।
+    রিটার্ন: (messages, err_or_None, kind)।
+
+    Strategy (অকারণ রিকোয়েস্ট এড়াতে):
+      1. get-inbox — আগের বার যে mode কাজ করেছে সেটা (ডিফল্ট oauth)
+      2. error 'cred/client' হলে অন্য mode; (খালি + deep=True হলেও অন্য mode একবার)
+      3. তবুও না পেলে (শুধু cred/client error বা deep) inbox-read
+      timeout/5xx/429/network এ অন্য endpoint-এ ঝাঁপ দেওয়া হয় না — সার্ভার ডাউন থাকলে লোড বাড়ানো হয় না।"""
+    full_data = (full_data or "").strip()
+    parts = [x.strip() for x in full_data.split("|")]
+    if len(parts) < 4 or "@" not in parts[0] or not parts[2] or not parts[3]:
+        return [], "token/client_id নেই বা format ভুল", "client"
+    email = parts[0].lower()
+    key = _mg_key(full_data)
+    lock = _mg_get_lock(key)
+    wait = (deadline - _time_module.time()) if deadline else MG_READ_TIMEOUT
+    if not lock.acquire(timeout=max(0.5, wait)):
+        return [], "সময় শেষ (আরেকটা চেক চলছে)", "timeout"
+    try:
+        rec = _mg_last.get(key)
+        if rec and rec[2] is None and (_time_module.time() - rec[0]) < MG_REUSE_SEC:
+            return rec[1], None, "ok"          # ঠিক এইমাত্র আনা হয়েছে — আবার সার্ভারে নয়
+
+        known = email in _mg_mode_pref
+        pref = _mg_mode_pref.get(email, "oauth")
+        other = "graph" if pref == "oauth" else "oauth"
+        first_err = first_kind = None
+        any_ok = False                      # কোনো একটা কল সফল (ইনবক্স খালি হলেও) হয়েছে কিনা
+        msgs, used_mode = [], pref
+
+        def _note(r_msgs, r_err, r_kind):
+            nonlocal first_err, first_kind, any_ok
+            if r_err:
+                if first_err is None or (r_kind in ("cred", "client") and first_kind not in ("cred", "client")):
+                    first_err, first_kind = r_err, r_kind
+            else:
+                any_ok = True
+
+        if not known:
+            # ⚡ কোন mode কাজ করে জানা নেই — oauth ও graph একসাথে চালাও, যেটা আগে মেসেজ দেয় সেটাই
+            win, allr = _mg_race([
+                lambda: _mg_get_inbox_m(full_data, "oauth", deadline),
+                lambda: _mg_get_inbox_m(full_data, "graph", deadline)])
+            for r in allr:
+                _note(r[0], r[1], r[2])
+                if not r[1] and r[3] in ("oauth", "graph") and r[3] not in _mg_mode_pref.get("_ok_" + email, ""):
+                    _mg_mode_pref["_ok_" + email] = r[3]
+            if win:
+                msgs, used_mode = win[0], win[3]
+            elif any_ok and _mg_mode_pref.get("_ok_" + email) in ("oauth", "graph"):
+                # ইনবক্স খালি কিন্তু একটা mode সফল — পরের পোলে আর দুটো চালাতে হবে না
+                _mg_mode_pref[email] = _mg_mode_pref["_ok_" + email]
+        else:
+            msgs, err, kind = _mg_get_inbox(full_data, pref, deadline)
+            _note(msgs, err, kind)
+            if (not msgs) and (deep or (err and kind in ("cred", "client"))):
+                # ⚡ অন্য mode ও inbox-read একসাথে (আগে একটার পর একটা চলত)
+                fns = [lambda: _mg_get_inbox_m(full_data, other, deadline)]
+                if first_kind not in ("apikey", "breaker", "busy"):
+                    fns.append(lambda: _mg_inbox_read_m(full_data, deadline))
+                win, allr = _mg_race(fns)
+                for r in allr:
+                    _note(r[0], r[1], r[2])
+                if win:
+                    msgs = win[0]
+                    used_mode = win[3] if win[3] in ("oauth", "graph") else used_mode
+        if (not msgs) and (deep or first_kind in ("cred", "client")) \
+                and first_kind not in ("apikey", "breaker", "busy") and not known:
+            m3, e3 = _mg_inbox_read_msgs(full_data, deadline)
+            if m3:
+                msgs = m3
+            elif not e3:
+                any_ok = True
+        if msgs:
+            if used_mode != _mg_mode_pref.get(email):
+                _mg_mode_pref[email] = used_mode
+            res = (msgs, None, "ok")
+        elif any_ok:
+            res = ([], None, "ok")          # মেইলবক্সে পৌঁছানো গেছে, ইনবক্স খালি
+        else:
+            res = ([], first_err, first_kind or "ok")
+        _mg_last[key] = (_time_module.time(), res[0], res[1], res[2])
+        _mg_prune()
+        return res
+    finally:
+        lock.release()
+
+
+def mailgen_get_inbox_full(full_data):
+    """(পুরোনো নাম, সামঞ্জস্যের জন্য) — messages list।"""
+    return mailgen_fetch_messages(full_data, deep=True)[0]
+
+
+def _mailgen_get_inbox_try(full_data, mode="oauth"):
+    """(পুরোনো নাম, /otpdebug এর জন্য) — একটা নির্দিষ্ট mode। রিটার্ন: (messages, err_or_None)।"""
+    msgs, err, _k = _mg_get_inbox(full_data, mode)
+    return msgs, err
+
+
+def _mg_admin_alert(key, text):
+    """অ্যাডমিনকে অ্যালার্ট — একই key ১০ মিনিটে একবারের বেশি নয় (outage এ spam এড়াতে)।"""
+    now = _time_module.time()
+    if now - _mg_alert_last.get(key, 0) < 600:
+        return
+    _mg_alert_last[key] = now
+    try:
+        bot.send_message(ADMIN_ID, text, parse_mode="HTML")
+    except Exception:
+        pass
+
+
+def mailgen_poll_for_code(full_data, window=None, max_age=None, tag=""):
+    """কোড/লিংক আসা পর্যন্ত পোল করে (ডিলেড মেইলের জন্য window সেকেন্ড পর্যন্ত)।
+    • পোল ব্যবধান ধীরে বাড়ে (OTP_POLL_DELAYS) — প্রতি ২ সেকেন্ডে সার্ভার পেটানো নয়
+    • ইনবক্সে আগে থেকে থাকা পুরোনো (> OTP_FRESH_SEC) কোড সঙ্গে সঙ্গে দেওয়া হয় না —
+      নতুনটা আসার জন্য window পর্যন্ত অপেক্ষা; না এলে শেষে পুরোনোটাই (তারিখ সহ) দেওয়া হয়
+    • টোকেন/API-key সমস্যা বা breaker খোলা থাকলে সঙ্গে সঙ্গে থামে (৪৫ সেকেন্ড বসিয়ে রাখে না)
+    রিটার্ন: (found_or_None, seen_msgs, last_err, last_kind, rounds)
+    found = (msg, code, links)"""
+    window = OTP_WAIT_MAX_SEC if window is None else window
+    max_age = OTP_MAX_AGE_SEC if max_age is None else max_age
+    t0 = _time_module.time()
+    deadline = t0 + window + MG_FINAL_GRACE
+    seen, last_err, last_kind = [], None, "ok"
+    stale = None
+    cred_hits = 0
+    rnd = 0
+    while True:
+        deep = (rnd == 0) or (rnd % 4 == 0)
+        msgs, err, kind = mailgen_fetch_messages(full_data, deep=deep, deadline=deadline)
+        rnd += 1
+        last_err, last_kind = err, kind
+        if msgs:
+            seen = msgs
+            found = _otp_scan_messages(msgs, max_age=max_age)
+            if found:
+                ts = found[0].get("_ts")
+                if ts is None or (_time_module.time() - ts) <= OTP_FRESH_SEC:
+                    logging.info(f"OTP[mailgen] {tag}: found after {rnd} round(s)")
+                    return found, seen, None, "ok", rnd
+                stale = found           # পুরোনো — নতুনের জন্য অপেক্ষা
+        if kind in ("apikey", "breaker"):
+            break
+        if kind in ("cred", "client"):      # টোকেন/ফরম্যাট ভুল — বারবার চেষ্টা করে লাভ নেই
+            cred_hits += 1
+            if cred_hits >= 2:
+                break
+        else:
+            cred_hits = 0
+        delay = OTP_POLL_DELAYS[min(rnd - 1, len(OTP_POLL_DELAYS) - 1)]
+        if _time_module.time() + delay >= t0 + window:
+            break
+        _time_module.sleep(delay)
+    if stale:
+        logging.info(f"OTP[mailgen] {tag}: no fresh code, returning older one after {rnd} round(s)")
+        return stale, seen, None, "ok", rnd
+    logging.info(f"OTP[mailgen] {tag}: nothing after {rnd} round(s) err={last_err!r} kind={last_kind}")
+    return None, seen, last_err, last_kind, rnd
 
 # ═══════════════════════════════════════════════════════════
 # 📩 GET OTP — Inbox Read (mailgen.shop) দিয়ে কোড / Verify Link খোঁজা
@@ -18344,14 +18862,13 @@ def mailgen_inbox_read(full_data, message_count=20):
 #    /api/inbox-read কল হয়; কোড বা verify link না আসা পর্যন্ত নিজে থেকেই
 #    কিছুক্ষণ পরপর চেক করে, আসলেই বটে পাঠিয়ে দেয়।
 # ═══════════════════════════════════════════════════════════
-# ✅ ক্রম: আগে dongvanfb (OTP_DV_PHASE_SEC সেকেন্ড), না পেলে MailGen (OTP_MG_PHASE_SEC সেকেন্ড)
-OTP_DV_PHASE_SEC      = 15     # dongvanfb থেকে কোড খোঁজার সময়
-OTP_MG_PHASE_SEC      = 15     # তারপর MailGen থেকে কোড খোঁজার সময়
-OTP_WAIT_MAX_SEC      = OTP_DV_PHASE_SEC + OTP_MG_PHASE_SEC   # মোট (ইউজারকে দেখানো সংখ্যা)
-OTP_DV_INTERVAL_SEC   = 3      # dongvanfb প্রতি কত সেকেন্ড পরপর চেক
-OTP_CHECK_INTERVAL_SEC = 2     # MailGen প্রতি কত সেকেন্ড পরপর চেক
+# ✅ শুধু MailGen (dongvanfb বাদ)। একটাই polling window — ডিলেড মেইলের জন্য OTP_WAIT_MAX_SEC পর্যন্ত অপেক্ষা।
+OTP_WAIT_MAX_SEC      = 45     # মোট অপেক্ষা (ইউজারকে দেখানো সংখ্যাও এটাই)
+OTP_POLL_DELAYS       = (1.5, 2, 2, 3, 3, 4)   # ⚡ পোলের ব্যবধান (সেকেন্ড) — শুরুতে দ্রুত, ধীরে বাড়ে, শেষটা বারবার
 OTP_MAX_API_ERRORS    = 3      # (পুরোনো কনস্ট্যান্ট — সামঞ্জস্যের জন্য রাখা)
 OTP_MAX_AGE_SEC       = 1800   # ৩০ মিনিটের পুরোনো কোড (তারিখ নিশ্চিত হলে) দেখাবে না
+OTP_FRESH_SEC         = 300    # ৫ মিনিটের মধ্যের কোড "নতুন" — সঙ্গে সঙ্গে দেয়; এর চেয়ে পুরোনো হলে নতুনটার জন্য অপেক্ষা
+OTP_SCAN_LIMIT        = 8      # সর্বশেষ কয়টা মেইল স্ক্যান করবে
 _otp_busy = {}   # {user_id: start_ts} — ডাবল ক্লিকে একই সাথে দুইবার চেক আটকাতে
 
 _OTP_KEYWORDS = ("code", "otp", "verify", "verification", "confirm", "security",
@@ -18372,23 +18889,75 @@ def _msg_is_verifyish(msg):
     t = _msg_text(msg).lower()
     return any(k in t for k in _OTP_KEYWORDS)
 
+_RE_OTP_SCRIPT = re.compile(r"(?is)<(script|style)\b.*?>.*?</\1>")
+_RE_OTP_COMMENT = re.compile(r"(?s)<!--.*?-->")
+_RE_OTP_TAG = re.compile(r"(?s)<[^>]+>")
+_RE_OTP_URL = re.compile(r"(?i)\b(?:https?://|www\.)\S+")
+_RE_OTP_HEX = re.compile(r"#[0-9a-fA-F]{3,8}\b")
+_RE_OTP_ZW = re.compile(r"[\u200b-\u200f\u2060\ufeff]")
+_OTP_NUM = r"(\d{3}[ \-]\d{3}|\d{4,8})"
+_OTP_KW = r"(?:\b(?:code|otp|pin|passcode|password)\b|কোড)"
+# অগ্রাধিকার অনুযায়ী প্যাটার্ন:
+#   "123456 is your ..."   |   "code: 123456", "code is 123456", "OTP 123456"
+_OTP_PATTERNS = (
+    re.compile(r"(?<![\d$.#])(?<!\d-)" + _OTP_NUM + r"(?!\d)\s*(?:is|as)\s+(?:your|the)\b", re.I),
+    re.compile(_OTP_KW + r"[^\d\n]{0,40}?(?<![\d$.#])(?<!\d-)" + _OTP_NUM + r"(?!\d)", re.I),
+)
+_OTP_FALLBACK = re.compile(r"(?<![\d$.,:/#])(?<!\d-)(\d{4,8})(?![\d%:/]|-\d|[.,]\d)")
+_OTP_YEAR = re.compile(r"(19|20)\d{2}")
+
+
+def _otp_clean_text(s):
+    """HTML/CSS/লিংক/hex-color বাদ দিয়ে শুধু পাঠযোগ্য টেক্সট — '#000000' বা CSS সংখ্যা যেন কোড হিসেবে না ধরা পড়ে।"""
+    import html as _h
+    s = str(s or "")
+    s = _RE_OTP_SCRIPT.sub(" ", s)
+    s = _RE_OTP_COMMENT.sub(" ", s)
+    s = _RE_OTP_TAG.sub(" ", s)
+    s = _h.unescape(s)
+    s = _RE_OTP_ZW.sub("", s)
+    s = _RE_OTP_URL.sub(" ", s)
+    s = _RE_OTP_HEX.sub(" ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _otp_norm_code(c):
+    c = str(c or "").strip()
+    if re.fullmatch(r"\d{3}[ \-]\d{3}", c):     # "123 456" / "123-456" → 123456
+        return re.sub(r"[ \-]", "", c)
+    return c
+
+
+def _otp_find_in_text(txt):
+    """কীওয়ার্ড/বাক্য-ভিত্তিক প্যাটার্ন — বছর (2026 ইত্যাদি) বাদ। না পেলে None।"""
+    for pat in _OTP_PATTERNS:
+        for mm in pat.finditer(txt):
+            c = _otp_norm_code(mm.group(1))
+            if not _OTP_YEAR.fullmatch(c):
+                return c
+    return None
+
+
 def _extract_otp_from_msg(msg):
-    """মেসেজ থেকে OTP কোড বের করে (API এর নিজস্ব 'code' ফিল্ড থাকলে সেটাই আগে)।"""
+    """মেসেজ থেকে OTP কোড বের করে।
+    ক্রম: ১) API এর নিজস্ব 'code' ফিল্ড  ২) subject এর প্যাটার্ন  ৩) body এর প্যাটার্ন
+          ৪) (শুধু verify-ধরনের মেইলে) fallback — ৬-ডিজিট আগে, তারপর ৪–৮ ডিজিট"""
     api_code = str(msg.get("code") or "").strip()
-    if api_code:
-        return api_code
-    txt = _msg_text(msg)
-    # 1) কীওয়ার্ডের কাছাকাছি সংখ্যা (যেমন "code: 123456", "123456 is your code")
-    m = re.search(r"(?:code|otp|pin|কোড)\D{0,20}?(?<![\d])(\d{4,8})(?!\d)", txt, re.I)
-    if not m:
-        m = re.search(r"(?<![\d])(\d{4,8})(?!\d)\s*(?:is|হলো|is your|as your)", txt, re.I)
-    if m:
-        return m.group(1)
-    # 2) verify-ধরনের মেইল হলে যেকোনো ৪–৮ ডিজিট (বছর যেমন 2026 বাদ)
+    if api_code and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9\- ]{2,11}", api_code):
+        return _otp_norm_code(api_code)
+    subj = _otp_clean_text(msg.get("subject"))
+    body = _otp_clean_text(" ".join(str(msg.get(f) or "") for f in ("message", "preview")))
+    c = _otp_find_in_text(subj) or _otp_find_in_text(body)
+    if c:
+        return c
     if _msg_is_verifyish(msg):
-        for mm in re.finditer(r"(?<![\d])(\d{4,8})(?!\d)", txt):
-            if not re.fullmatch(r"(19|20)\d{2}", mm.group(1)):
-                return mm.group(1)
+        pool = f"{subj} {body}"
+        cands = [m.group(1) for m in _OTP_FALLBACK.finditer(pool) if not _OTP_YEAR.fullmatch(m.group(1))]
+        six = [x for x in cands if len(x) == 6]
+        if six:
+            return six[0]
+        if cands:
+            return cands[0]
     return None
 
 def _extract_links_from_msg(msg):
@@ -18406,59 +18975,21 @@ def _extract_links_from_msg(msg):
         return good[:3]
     return links[:3] if _msg_is_verifyish(msg) else []
 
-def _mailgen_get_inbox_try(full_data, mode="oauth"):
-    """/api/get-inbox (oauth/graph) — মেসেজের পূর্ণ 'message' ও তৈরি 'code' ফিল্ড আসে।
-    ফরম্যাট (docs): email|refresh_token|client_id|client_secret
-    রিটার্ন: (messages_list, error_or_None)।"""
-    try:
-        parts = [x.strip() for x in full_data.split("|")]
-        if len(parts) < 4:
-            return [], "token/client_id নেই"
-        # কেনা ডেটা: email|password|refresh_token|client_id  →  email|refresh_token|client_id|(secret)
-        oauth_data = f"{parts[0]}|{parts[2]}|{parts[3]}|" + (parts[4] if len(parts) > 4 else "")
-        headers = {"Content-Type": "application/json"}
-        if MAILGEN_API_KEY:
-            headers["X-API-Key"] = MAILGEN_API_KEY
-        last_err = None
-        for attempt in range(2):
-            resp = http_requests.post(f"{MAILGEN_BASE_URL}/api/get-inbox",
-                                      json={"data": oauth_data, "mode": mode},
-                                      headers=headers, timeout=25)
-            try:
-                data = resp.json()
-            except Exception:
-                last_err = f"non-JSON (HTTP {resp.status_code})"
-                logging.warning(f"mailgen get-inbox[{mode}] non-JSON: {resp.status_code} {resp.text[:200]}")
-                _time_module.sleep(1)
-                continue
-            if resp.status_code == 429:
-                last_err = "rate limit (429)"
-                _time_module.sleep(min(float(data.get("retry_after") or 2), 5))
-                continue
-            if data.get("error"):
-                return [], str(data.get("error"))
-            msgs = data.get("messages") or []
-            logging.info(f"mailgen get-inbox[{mode}] → {len(msgs)} msgs")
-            return msgs, None
-        return [], last_err or "unknown"
-    except Exception as e:
-        logging.info(f"mailgen get-inbox[{mode}] failed: {e}")
-        return [], f"{type(e).__name__}: {e}"
-
-def mailgen_get_inbox_full(full_data):
-    """oauth এ মেসেজ না পেলে graph mode ও try করে। রিটার্ন: messages list।"""
-    msgs, err = _mailgen_get_inbox_try(full_data, "oauth")
-    if not msgs:
-        msgs2, err2 = _mailgen_get_inbox_try(full_data, "graph")
-        if msgs2:
-            return msgs2
-    return msgs
-
 def _otp_parse_ts(d):
-    """ISO তারিখে timezone (Z/+00:00) থাকলে epoch সেকেন্ড, নাহলে None।"""
+    """ISO তারিখে timezone (Z/+00:00) থাকলে, অথবা epoch (সেকেন্ড/মিলিসেকেন্ড) হলে epoch সেকেন্ড; নাহলে None।"""
     try:
+        if isinstance(d, (int, float)) and not isinstance(d, bool):
+            v = float(d)
+            return v / 1000.0 if v > 1e11 else v
+        s = str(d or "").strip()
+        if not s:
+            return None
+        if re.fullmatch(r"\d{10,13}", s):
+            v = float(s)
+            return v / 1000.0 if v > 1e11 else v
+        s = re.sub(r"(\.\d{6})\d+", r"\1", s.replace("Z", "+00:00"))   # Outlook এর ৭-ডিজিট ভগ্নাংশ
         from datetime import datetime as _dt
-        x = _dt.fromisoformat(str(d or "").strip().replace("Z", "+00:00"))
+        x = _dt.fromisoformat(s)
         return x.timestamp() if x.tzinfo is not None else None
     except Exception:
         return None
@@ -18514,96 +19045,18 @@ def _build_otp_copy_button(code):
     except Exception:
         return InlineBtn(f"📋 {code}", style=_ik("inline_otp_code"), callback_data=f"2fa_showcode_{code}")
 
-DONGVAN_MSG_URL = "https://tools.dongvanfb.net/api/get_messages_oauth2"
-
 def _strip_html(t):
     t = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", str(t or ""))
     t = re.sub(r"(?s)<[^>]+>", " ", t)
     import html as _h
     return re.sub(r"\s+", " ", _h.unescape(t)).strip()
 
-def _dongvan_get_messages(full_data, timeout=20):
-    """dongvanfb get_messages_oauth2 (API key লাগে না) — Hotmail/Outlook token
-    (email|password|refresh_token|client_id) দিয়ে ইনবক্স পড়ে। MailGen ব্যর্থ হলেও
-    এই একই ধরনের token এ এটা সাধারণত কাজ করে।
-    রিটার্ন: (messages_list_normalized, error_or_None)।"""
-    try:
-        parts = [x.strip() for x in full_data.split("|")]
-        if len(parts) < 4:
-            return [], "token/client_id নেই"
-        payload = {"email": parts[0], "refresh_token": parts[2],
-                   "client_id": parts[3], "list_mail": "all"}
-        resp = http_requests.post(DONGVAN_MSG_URL, json=payload,
-                                  headers={"Content-Type": "application/json"}, timeout=timeout)
-        try:
-            data = resp.json()
-        except Exception:
-            return [], f"non-JSON (HTTP {resp.status_code})"
-        st = data.get("status")
-        if not (st is True or st == 1 or str(st).lower() == "true"):
-            return [], str(data.get("content") or data.get("message") or data.get("error") or data)[:120]
-        raw = data.get("messages") or data.get("data") or data.get("emails") or data.get("list") or []
-        out = []
-        for mail in raw if isinstance(raw, list) else []:
-            if not isinstance(mail, dict):
-                continue
-            fr = mail.get("from") or mail.get("sender") or ""
-            if isinstance(fr, list) and fr:
-                f0 = fr[0]
-                fr = (f0.get("name") or f0.get("address") or "") if isinstance(f0, dict) else str(f0)
-            elif isinstance(fr, dict):
-                fr = fr.get("name") or fr.get("address") or ""
-            body = " ".join(str(mail.get(k)) for k in ("message", "body", "html", "html_body", "content", "text") if mail.get(k))
-            out.append({
-                "subject": str(mail.get("subject") or mail.get("title") or ""),
-                "from": str(fr),
-                "date": str(mail.get("date") or ""),
-                "code": str(mail.get("code") or "").strip(),
-                "_ts": _otp_parse_ts(mail.get("date")),   # timezone-সহ তারিখ হলে epoch, নাহলে None
-                "message": body,                      # লিংক খোঁজার জন্য raw HTML সহ
-                "preview": _strip_html(body)[:300],   # ইউজারকে দেখানোর জন্য পরিষ্কার text
-            })
-        # নতুন আগে সাজাও (date পার্স করা গেলে)
-        if out and all(m.get("_ts") for m in out):
-            out.sort(key=lambda m: m["_ts"], reverse=True)
-        logging.info(f"dongvanfb get_messages_oauth2 → {len(out)} msgs")
-        return out, None
-    except Exception as e:
-        return [], f"{type(e).__name__}: {e}"
-
-def _otp_fetch_mailgen(full_data):
-    """MailGen এক রাউন্ড: inbox-read → get-inbox (oauth → graph)।
-    রিটার্ন: (found, seen_msgs, dbg_dict)।"""
-    dbg = {"ir": None, "gi": None, "n_ir": 0, "n_gi": 0}
-    seen = []
-    data, dbg["ir"] = mailgen_inbox_read(full_data)
-    ir_msgs = ((data or {}).get("messages") or []) if not dbg["ir"] else []
-    dbg["n_ir"] = len(ir_msgs)
-    if ir_msgs:
-        seen = ir_msgs
-        found = _otp_scan_messages(ir_msgs[:5])      # শুধু সর্বশেষ ৫টা — পুরোনো কোড এড়াতে
-        if found:
-            return found, seen, dbg
-    gi_msgs, dbg["gi"] = _mailgen_get_inbox_try(full_data, "oauth")
-    if not gi_msgs:
-        m2, e2 = _mailgen_get_inbox_try(full_data, "graph")
-        if m2:
-            gi_msgs, dbg["gi"] = m2, None
-        elif not dbg["gi"]:
-            dbg["gi"] = e2
-    dbg["n_gi"] = len(gi_msgs)
-    if gi_msgs:
-        seen = seen or gi_msgs
-        found = _otp_scan_messages(gi_msgs[:5])
-        if found:
-            return found, seen, dbg
-    return None, seen, dbg
-
 def _otp_scan_messages(messages, max_age=None):
-    """মেসেজ লিস্ট (নতুন আগে) স্ক্যান করে প্রথম যে মেসেজে কোড বা লিংক পাওয়া যায় সেটা রিটার্ন করে:
-    (msg, code, links) অথবা None।"""
+    """মেসেজ লিস্ট স্ক্যান করে (নতুন আগে) প্রথম যে মেসেজে কোড বা লিংক পাওয়া যায় সেটা রিটার্ন করে:
+    (msg, code, links) অথবা None। শুধু সর্বশেষ OTP_SCAN_LIMIT টা মেইল দেখে — পুরোনো কোড এড়াতে।"""
     _now = _time_module.time()
-    for m in messages or []:
+    msgs = [x for x in (_mg_norm_one(m) for m in (messages or [])) if x is not None]
+    for m in msgs[:OTP_SCAN_LIMIT]:
         _ts = m.get("_ts")
         if max_age and _ts and (_now - _ts) > max_age:
             continue    # অনেক পুরোনো মেইল — ভুল/expired কোড দেখাবে না
@@ -18623,12 +19076,23 @@ def _otp_send_result(user_id, email, found):
     service = _otp_service_name(m)
     t_str = _otp_fmt_time(m.get("date"))
     markup = types.InlineKeyboardMarkup(row_width=1)
+    stale_note = ""
+    try:
+        _ts = m.get("_ts")
+        if _ts and (_time_module.time() - _ts) > OTP_FRESH_SEC:
+            _mins = int((_time_module.time() - _ts) // 60)
+            stale_note = (f"\n\n⚠️ <i>এটি {_mins} মিনিট আগের মেইল। নতুন কোড রিকোয়েস্ট করে থাকলে "
+                          f"একটু পরে আবার চেষ্টা করুন।</i>")
+    except Exception:
+        stale_note = ""
     if code:
         head = "✅ <b>OTP Found!</b>"
+        code_line = f"🔑 <b>OTP:</b> <code>{_hx(code)}</code>\n"
         hint = "\n\n👇 <i>OTP কপি করতে নিচের বাটনে ট্যাপ করুন</i>"
         markup.add(_build_otp_copy_button(code))
     else:
         head = "🔗 <b>Link Found!</b>"
+        code_line = ""
         hint = "\n\n👇 <i>লিংক খুলতে নিচের বাটনে ট্যাপ করুন</i>"
         for i, u in enumerate(links[:2], start=1):
             markup.add(InlineBtn("🔗 Verify Link" + ("" if len(links) == 1 else f" {i}"),
@@ -18636,10 +19100,90 @@ def _otp_send_result(user_id, email, found):
     text = (f"{head}\n\n"
             f"📧 <b>Email:</b> <code>{_hx(email)}</code>\n"
             f"🏷️ <b>Service:</b> {_hx(service)}\n"
+            f"{code_line}"
             f"🕒 <b>Time:</b> {_hx(t_str)}"
-            f"{hint}")
+            f"{stale_note}{hint}")
     bot.send_message(user_id, text, parse_mode="HTML",
                      disable_web_page_preview=True, reply_markup=markup)
+
+
+def _otp_failed_text(email, kind):
+    """ইনবক্স চেক পুরোপুরি ব্যর্থ — ইউজারকে সাইট/এরর ডিটেইল না দেখিয়ে শুধু ব্যবহারযোগ্য হিন্ট।"""
+    _now_bd = datetime.now(BD_TZ).strftime("%I:%M:%S %p - %d/%m/%Y") + " (BD)"
+    hint = ""
+    if kind in ("cred", "client"):
+        hint = "\n\n⚠️ এই মেইলের token/অ্যাকাউন্ট কাজ করছে না (মেয়াদোত্তীর্ণ বা ভুল হতে পারে)। Support এ জানান।"
+    elif kind:
+        hint = "\n\n🔄 সার্ভার সাময়িকভাবে ব্যস্ত — ১-২ মিনিট পরে আবার চেষ্টা করুন।"
+    return (f"❌ <b>Inbox চেক করা যায়নি!</b>\n\n"
+            f"📧 <b>Email:</b> <code>{_hx(email)}</code>\n"
+            f"🕒 <b>Time:</b> {_now_bd}{hint}")
+
+
+def _otp_not_found_text(email, seen_msgs, err=None, kind=None, show_debug=False,
+                        retry_hint="📩 Get OTP বাটনে ক্লিক করুন"):
+    """window এর মধ্যে কোড/লিংক আসেনি।"""
+    extra = ""
+    try:
+        if seen_msgs:
+            m0 = seen_msgs[0]
+            _pv = re.sub(r"\s+", " ", str(m0.get("preview") or _strip_html(m0.get("message") or "")))[:140]
+            extra = (f"\n\n📨 ইনবক্সে {len(seen_msgs)}টা মেইল আছে, কিন্তু নতুন কোড/লিংক চেনা যায়নি।\n"
+                     f"সর্বশেষ: <b>{_hx(str(m0.get('from') or '')[:30])}</b> — {_hx(str(m0.get('subject') or '')[:60])} "
+                     f"({_hx(_otp_fmt_time(m0.get('date')))})"
+                     + (f"\n<code>{_hx(_pv)}</code>" if _pv else ""))
+        elif show_debug:
+            extra = f"\n\n🛠 <i>Debug:</i> মেসেজ 0 — kind={_hx(kind)} err={_hx(err)} (বিস্তারিত: /otpdebug)"
+    except Exception:
+        extra = ""
+    return (f"📭 <b>{OTP_WAIT_MAX_SEC} সেকেন্ডে কোনো কোড/লিংক আসেনি</b>\n\n📧 <code>{_hx(email)}</code>\n\n"
+            f"👉 <b>আগে এই মেইলের মধ্যে কোড পাঠান</b> (যে সাইট/অ্যাপে মেইলটা ব্যবহার করবেন সেখানে "
+            f"এই মেইল দিয়ে কোড রিকোয়েস্ট করুন), <b>তারপর {retry_hint}।</b>"
+            + extra)
+
+
+def _send_wait_async(user_id, text):
+    """⚡ 'অপেক্ষা করুন' মেসেজ আলাদা thread এ পাঠায় — Telegram round-trip এর জন্য inbox চেক দেরি হয় না।"""
+    box = {}
+    def _run():
+        try:
+            box["m"] = bot.send_message(user_id, text, parse_mode="HTML")
+        except Exception:
+            pass
+    th = threading.Thread(target=_run, daemon=True)
+    th.start()
+    return th, box
+
+
+def _delete_wait_async(user_id, th, box):
+    try:
+        th.join(timeout=3)
+        m = box.get("m")
+        if m:
+            bot.delete_message(user_id, m.message_id)
+    except Exception:
+        pass
+
+
+def _otp_report_failure(user_id, email, err, kind):
+    """আসল কারণ শুধু অ্যাডমিনকে — একই ধরনের সমস্যা ১০ মিনিটে একবার (outage এ spam নয়)।"""
+    try:
+        if is_admin(user_id):
+            return
+        if kind == "apikey":
+            _mg_admin_alert("mg:apikey",
+                "🚨 <b>Mailgen API key সমস্যা!</b>\n\n<code>MAILGEN_API_KEY</code> ঠিক আছে কিনা চেক করুন।\n"
+                f"<i>{_hx(str(err)[:150])}</i>")
+        elif kind in ("breaker", "server", "timeout", "network", "rate", "bad", "busy"):
+            _mg_admin_alert(f"mg:{kind}",
+                f"🔍 <b>Mailgen সার্ভার সমস্যা</b> ({_hx(kind)})\n<i>{_hx(str(err)[:150])}</i>\n"
+                f"👤 User: <code>{user_id}</code>")
+        else:
+            _mg_admin_alert(f"mg:{kind}:{email}",
+                f"🔍 <b>OTP Inbox Error</b> ({_hx(kind)})\n\n👤 User: <code>{user_id}</code>\n"
+                f"📧 <code>{_hx(email)}</code>\n<i>{_hx(str(err)[:150])}</i>")
+    except Exception:
+        pass
 
 def handle_get_otp_from_keyboard(user_id, db):
     """📩 Get OTP (শুধু Single Buy) — সর্বশেষ কেনা মেইলের Full Data/Token দিয়ে
@@ -18678,95 +19222,23 @@ def handle_get_otp_from_keyboard(user_id, db):
                      daemon=True, name=f"otp_check_{user_id}").start()
 
 def _otp_check_worker(user_id, email, full_data):
-    """প্রথমে dongvanfb থেকে OTP_DV_PHASE_SEC সেকেন্ড ধরে চেক করে; না পেলে MailGen থেকে
-    OTP_MG_PHASE_SEC সেকেন্ড ধরে। কোড/verify link পেলে সাথে সাথে পাঠিয়ে থামে।"""
+    """Mailgen থেকে OTP_WAIT_MAX_SEC সেকেন্ড পর্যন্ত (ডিলেড মেইল সহ) কোড/verify link খোঁজে;
+    পেলে সাথে সাথে পাঠিয়ে থামে।"""
     kb = get_product_buy_keyboard(user_id)
     wait_msg = None
     try:
-        wait_msg = bot.send_message(
-            user_id, f"⏳ <b>Inbox চেক হচ্ছে...</b>\n📧 <code>{_hx(email)}</code>", parse_mode="HTML")
-        found = None
-        seen_msgs = []          # সর্বশেষ যে মেসেজ লিস্ট পাওয়া গেছে (কোড না পেলে ইউজারকে দেখানোর জন্য)
-        dv_err = err = full_err = None
-        mg_ran = False
-
-        # ── ধাপ ১: dongvanfb ──
-        p1 = _time_module.time()
-        while True:
-            msgs, dv_err = _dongvan_get_messages(full_data, timeout=10)
-            if msgs:
-                seen_msgs = msgs
-                found = _otp_scan_messages(msgs, max_age=OTP_MAX_AGE_SEC)
-            logging.info(f"OTP[dongvanfb] uid={user_id}: msgs={len(msgs)} err={dv_err!r} found={bool(found)}")
-            if found:
-                break
-            if (_time_module.time() - p1) + OTP_DV_INTERVAL_SEC >= OTP_DV_PHASE_SEC:
-                break
-            _time_module.sleep(OTP_DV_INTERVAL_SEC)
-
-        # ── ধাপ ২: MailGen (dongvanfb এ না পেলে) ──
-        if not found:
-            mg_ran = True
-            p2 = _time_module.time()
-            while True:
-                found, _seen, _dbg = _otp_fetch_mailgen(full_data)
-                if _seen and not seen_msgs:
-                    seen_msgs = _seen
-                err, full_err = _dbg["ir"], _dbg["gi"]
-                logging.info(f"OTP[mailgen] uid={user_id}: inbox-read msgs={_dbg['n_ir']} err={err!r} | "
-                             f"get-inbox msgs={_dbg['n_gi']} err={full_err!r} | found={bool(found)}")
-                if found:
-                    break
-                if (_time_module.time() - p2) + OTP_CHECK_INTERVAL_SEC >= OTP_MG_PHASE_SEC:
-                    break
-                _time_module.sleep(OTP_CHECK_INTERVAL_SEC)
-
-        try:
-            bot.delete_message(user_id, wait_msg.message_id)
-        except Exception:
-            pass
-
-        all_failed = (not seen_msgs) and bool(dv_err) and mg_ran and bool(err) and bool(full_err)
+        _w_th, _w_box = _send_wait_async(
+            user_id, f"⏳ <b>Inbox চেক হচ্ছে...</b>\n📧 <code>{_hx(email)}</code>")
+        found, seen_msgs, err, kind, rounds = mailgen_poll_for_code(full_data, tag=f"uid={user_id}")
+        _delete_wait_async(user_id, _w_th, _w_box)
         if found:
             _otp_send_result(user_id, email, found)
-        elif all_failed:
-            # ইউজারকে কোনো সাইট/এরর ডিটেইল দেখানো হয় না — শুধু Email আর সময় (BD)
-            _now_bd = datetime.now(BD_TZ).strftime("%I:%M:%S %p - %d/%m/%Y") + " (BD)"
-            bot.send_message(user_id,
-                f"❌ <b>Inbox চেক করা যায়নি!</b>\n\n"
-                f"📧 <b>Email:</b> <code>{_hx(email)}</code>\n"
-                f"🕒 <b>Time:</b> {_now_bd}",
-                parse_mode="HTML", reply_markup=kb)
-            # আসল কারণ শুধু অ্যাডমিনকে (ইউজার অ্যাডমিন না হলে আলাদা মেসেজ)
-            try:
-                if not is_admin(user_id):
-                    bot.send_message(ADMIN_ID,
-                        f"🔍 <b>OTP Inbox Error</b>\n\n👤 User: <code>{user_id}</code>\n"
-                        f"📧 <code>{_hx(email)}</code>\n"
-                        f"<i>{_hx(str(dv_err)[:120])} / {_hx(str(err)[:120])}</i>",
-                        parse_mode="HTML")
-            except Exception:
-                pass
+        elif (not seen_msgs) and err and kind != "ok":
+            bot.send_message(user_id, _otp_failed_text(email, kind), parse_mode="HTML", reply_markup=kb)
+            _otp_report_failure(user_id, email, err, kind)
         else:
-            extra = ""
-            try:
-                if seen_msgs:
-                    m0 = seen_msgs[0]
-                    _pv = re.sub(r"\s+", " ", str(m0.get("preview") or m0.get("message") or ""))[:140]
-                    extra = (f"\n\n📨 ইনবক্সে {len(seen_msgs)}টা মেইল আছে, কিন্তু নতুন কোড/লিংক চেনা যায়নি।\n"
-                             f"সর্বশেষ: <b>{_hx(str(m0.get('from') or '')[:30])}</b> — {_hx(str(m0.get('subject') or '')[:60])} "
-                             f"({_hx(_otp_fmt_time(m0.get('date')))})"
-                             + (f"\n<code>{_hx(_pv)}</code>" if _pv else ""))
-                elif is_admin(user_id):
-                    extra = (f"\n\n🛠 <i>Debug:</i> মেসেজ 0 — dongvanfb err={_hx(dv_err)}, inbox-read err={_hx(err)}, "
-                             f"get-inbox err={_hx(full_err)} (বিস্তারিত: /otpdebug)")
-            except Exception:
-                extra = ""
             bot.send_message(user_id,
-                f"📭 <b>{OTP_WAIT_MAX_SEC} সেকেন্ডে কোনো কোড/লিংক আসেনি</b>\n\n📧 <code>{_hx(email)}</code>\n\n"
-                f"👉 <b>আগে এই মেইলের মধ্যে কোড পাঠান</b> (যে সাইট/অ্যাপে মেইলটা ব্যবহার করবেন সেখানে "
-                f"এই মেইল দিয়ে কোড রিকোয়েস্ট করুন), <b>তারপর 📩 Get OTP বাটনে ক্লিক করুন।</b>"
-                + extra,
+                _otp_not_found_text(email, seen_msgs, err, kind, show_debug=is_admin(user_id)),
                 parse_mode="HTML", reply_markup=kb)
     except Exception as e:
         logging.error(f"_otp_check_worker error: {e}")
@@ -21345,7 +21817,11 @@ def process_purchase(user_id, product_name, quantity, price, total_price, displa
 
                 try:
                     # Stock file read ও write একই lock এর ভেতরে — safe ✅
-                    stock_file = read_stock_file(product_name, quantity)
+                    # 🛡️ VPN প্রোডাক্ট: শেয়ার্ড reader (row মোছে না, ledger নেই)
+                    if _is_vpn_category_product(product_name):
+                        stock_file = read_stock_file_shared(product_name, quantity)
+                    else:
+                        stock_file = read_stock_file(product_name, quantity)
                 except Exception as e:
                     logging.error(f"Stock read error: {e}\n{traceback.format_exc()}")
                     bot.send_message(user_id, t(user_id, "file_error"),
@@ -21575,10 +22051,12 @@ def process_purchase(user_id, product_name, quantity, price, total_price, displa
 
                 if not delivery_ok:
                     # Delivery ব্যর্থ (পাঠানোর আগেই — কিছুই যায়নি) — stock ফেরত দাও, balance কাটবো না
-                    try:
-                        _restore_stock_file(product_name, stock_file)
-                    except Exception as re:
-                        logging.error(f"Stock restore error: {re}")
+                    # 🛡️ VPN: শেয়ার্ড reader কিছু মোছেনি — restore করলে row ডুপ্লিকেট হতো
+                    if not _is_vpn_category_product(product_name):
+                        try:
+                            _restore_stock_file(product_name, stock_file)
+                        except Exception as re:
+                            logging.error(f"Stock restore error: {re}")
                     bot.send_message(user_id,
                         "❌ <b>Delivery ব্যর্থ হয়েছে!</b>\n\nআপনার balance কাটা হয়নি। আবার চেষ্টা করুন।",
                         parse_mode="HTML", reply_markup=get_main_menu(user_id))
@@ -25906,6 +26384,7 @@ def _bot_settings_view():
         InlineBtn("💳 Binance Pay ID", style="primary", callback_data="admin_bset_edit_binancepay"),
     )
     markup.row(InlineBtn("📞 Support Username", style="primary", callback_data="admin_bset_edit_support"))
+    markup.row(InlineBtn("🌐 OTP Site Link", style="primary", callback_data="admin_bset_edit_otpsite"))
     markup.row(InlineBtn("🔙 Admin Panel", style="primary", callback_data="back_admin"))
     return text, markup
 
@@ -25921,7 +26400,8 @@ def _bot_setting_current(field):
             "minrocket": get_method_min_deposit("rocket"),
             "developer": (DEVELOPER_USERNAME or SUPPORT_USERNAME),
             "livechat": (LIVECHAT_USERNAME or SUPPORT_USERNAME),
-            "binance": BINANCE_ID, "binancepay": (BINANCE_PAY_UID or BINANCE_ID)}.get(field, "")
+            "binance": BINANCE_ID, "binancepay": (BINANCE_PAY_UID or BINANCE_ID),
+            "otpsite": (get_otp_site_url() or "সেট নেই")}.get(field, "")
 
 def _normalize_bd_number(raw):
     """01XXXXXXXXX (১১ ডিজিট) ফরম্যাটে রিটার্ন করে; ভুল হলে None।"""
@@ -25975,6 +26455,10 @@ def _bot_settings_worker_impl(call):
             hint = "নতুন নম্বর পাঠান (১১ ডিজিট, যেমন: <code>01712345678</code>)"
         elif meta["kind"] == "binance":
             hint = "নতুন Binance ID পাঠান (শুধু সংখ্যা, যেমন: <code>761945447</code>)"
+        elif meta["kind"] == "link":
+            hint = ("OTP Site এর লিংক পাঠান (যেমন: <code>https://example.com</code>)\n"
+                    "💻 Code বাটনের প্রম্পটে <b>OTP SITE</b> হিসেবে দেখাবে।\n"
+                    "লিংক মুছে লাইনটা বন্ধ করতে <code>off</code> লিখুন।")
         elif meta["kind"] == "mindep":
             hint = (f"এই মেথডের নতুন Minimum Deposit পাঠান (BDT, ১ থেকে {MAX_DEPOSIT_AMOUNT}, যেমন: <code>50</code>)\n"
                     f"ডিফল্টে ফিরতে <code>reset</code> লিখুন (গ্লোবাল: {MIN_DEPOSIT} BDT)")
@@ -26023,6 +26507,12 @@ def admin_bot_setting_step(message, field):
             except Exception:
                 value = None
         err = f"❌ <b>সঠিক সংখ্যা দিন</b> (১ থেকে {MAX_DEPOSIT_AMOUNT} BDT):"
+    elif meta["kind"] == "link":
+        if raw.lower() in ("off", "reset", "remove", "clear"):
+            value = ""      # খালি = OTP SITE লাইন দেখানো বন্ধ
+        else:
+            value = raw if re.fullmatch(r"(?i)https?://\S+", raw) else None
+        err = "❌ <b>সঠিক লিংক দিন</b> (<code>https://</code> দিয়ে শুরু) — বন্ধ করতে <code>off</code> লিখুন:"
     elif meta["kind"] == "binance":
         _b = re.sub(r"[\s\-]", "", raw.translate(_BN_DIGITS))
         value = _b if re.fullmatch(r"\d{5,20}", _b) else None
@@ -26030,7 +26520,7 @@ def admin_bot_setting_step(message, field):
     else:
         value = _normalize_tg_username(raw)
         err = "❌ <b>সঠিক Username দিন</b> (৫-৩২ অক্ষর, a-z, 0-9, _ ):"
-    if value is None or (not value and meta["kind"] != "mindep"):
+    if value is None or (not value and meta["kind"] not in ("mindep", "link")):
         msg = bot.send_message(uid, err, parse_mode="HTML", reply_markup=get_cancel_button(uid))
         bot.register_next_step_handler(msg, admin_bot_setting_step, field)
         return
@@ -26038,7 +26528,7 @@ def admin_bot_setting_step(message, field):
     set_bot_setting(meta["db_key"], value)
     if meta["kind"] == "mindep" and not value:
         value = f"ডিফল্ট ({MIN_DEPOSIT})"
-    shown = f"@{value}" if meta["kind"] == "username" else value
+    shown = f"@{value}" if meta["kind"] == "username" else (value or "বন্ধ (OTP SITE লাইন দেখাবে না)")
     bot.send_message(uid,
         f"✅ <b>{meta['label']} আপডেট হয়েছে!</b>\n\nনতুন: <code>{shown}</code>\n\n"
         f"এখন থেকে বটের সব জায়গায় এটাই দেখাবে।",
@@ -32985,24 +33475,15 @@ def handle_token_command_legacy(message):
 
 @bot.message_handler(commands=['get_code'])
 def handle_get_code_command(message):
+    """/get_code ও /token — আগে dongvanfb.net এর লিংক দেখাত; এখন সরাসরি বটের ভেতরেই
+    Mailgen দিয়ে কোড আনে (💻 Code</> এর মতোই: email|pass|refresh_token|client_id পাঠান)।"""
     user_id = str(message.chat.id)
     db = load_db()
 
     if user_id in db.get("banned_users", []):
         return
 
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(
-        InlineBtn("📨 Hotmail & Outlook code", style="primary", url="https://dongvanfb.net/read_mail_box"),
-        InlineBtn("🏠 Main Menu", style="primary", callback_data="back_to_main"))
-
-    bot.send_message(user_id,
-        "🔑 <b>Get Code — Tools</b>\n\n"
-        "\n"
-        "নিচের বাটনে ক্লিক করে সরাসরি সাইটে যান:\n"
-        "",
-        parse_mode="HTML",
-        reply_markup=markup)
+    handle_code_command(message)
 
 def process_token_data(message):
     """Legacy handler - no longer used, /token now opens website."""
@@ -33184,7 +33665,7 @@ def _token_retry_worker_impl(call):
 
 
 # ═══════════════════════════════════════════════════════════
-# 📧 FEATURE: /code COMMAND — Get OTP via OAuth2 (dongvanfb)
+# 📧 FEATURE: /code COMMAND — Get OTP via Mailgen API
 # ═══════════════════════════════════════════════════════════
 
 _code_session = {}
@@ -33231,24 +33712,17 @@ def _is_menu_navigation_text(user_id, text):
 @bot.message_handler(commands=['code'])
 def handle_code_command(message):
     user_id = str(message.chat.id)
-    # ⏳ ছোট্ট লোডিং মুহূর্ত — ইউজারের আকর্ষণের জন্য, তারপর আসল প্রম্পটে এডিট হয়ে যায়
-    loading_msg = bot.send_message(user_id, "⏳ <b>Loading...</b>", parse_mode="HTML")
-    try:
-        import time as _code_load_time
-        _code_load_time.sleep(0.4)
-    except Exception:
-        pass
+    # ⚡ কৃত্রিম Loading delay বাদ — সরাসরি প্রম্পট; ইউজার token লেখার সময়েই connection গরম করে রাখি
+    threading.Thread(target=_mg_prewarm, daemon=True).start()
+    _site = get_otp_site_url()
+    _site_line = (f"🌐 <b>OTP SITE:</b> {_hx(_site)}\n\n") if _site else ""
     prompt = (
         "📧 <b>OTP Fetcher</b>\n\n"
-        "Send your complete Hotmail full data:\n\n"
-        "<code>email|pass|refresh_token|client_id</code>\n\n"
+        f"{_site_line}"
+        "<b>Send your complete Hotmail full data:</b>\n"
+        "<code>email|pass|refresh_token|client_id</code>👇"
     )
-    try:
-        bot.edit_message_text(prompt, chat_id=loading_msg.chat.id,
-            message_id=loading_msg.message_id, parse_mode="HTML")
-        msg = loading_msg
-    except Exception:
-        msg = bot.send_message(user_id, prompt, parse_mode="HTML")
+    msg = bot.send_message(user_id, prompt, parse_mode="HTML", disable_web_page_preview=True)
     bot.register_next_step_handler(msg, process_code_input)
 
 
@@ -33271,7 +33745,7 @@ def process_code_input(message):
     text = (message.text or "").strip()
     parts = text.split("|")
 
-    if len(parts) < 4:
+    if len(parts) < 4 or "@" not in parts[0] or not parts[2].strip() or not parts[3].strip():
         msg = bot.send_message(
             user_id,
             "❌ <b>Format ভুল!</b>\n\n"
@@ -33296,7 +33770,8 @@ def process_code_input(message):
         "client_id": client_id
     }
 
-    _EXECUTOR.submit(_do_code_fetch, user_id, email, refresh_token, client_id)
+    threading.Thread(target=_do_code_fetch, args=(user_id, email, refresh_token, client_id),
+                     daemon=True, name=f"code_fetch_{user_id}").start()
 
 
 def _detect_service_type(*texts):
@@ -33347,161 +33822,48 @@ def _detect_service_type(*texts):
 
 
 def _do_code_fetch(user_id, email, refresh_token, client_id):
-    import time as _time
+    """/code এবং 💻 Code</> বাটন — Mailgen দিয়ে OTP/verify link আনে (dongvanfb আর নয়)।"""
+    user_id = str(user_id)
+    sess = _code_session.get(user_id) or {}
+    password = (sess.get("password") or "") if sess.get("email") == email else ""
+    full_data = "|".join([email, password, refresh_token, client_id])
 
-    # ✅ API key সেট করা না থাকলে সরাসরি জানিয়ে দাও — ৩০ সেকেন্ড
-    # অযথা wait করানোর দরকার নেই, ওই সময় ধরে সবসময় fail হবে
-    if not DONGVANFB_API_KEY:
-        bot.send_message(user_id,
-            "⚠️ <b>OTP service সাময়িক বন্ধ আছে।</b>\n\nAdmin কে জানান।",
-            parse_mode="HTML", reply_markup=get_main_menu(user_id))
-        try:
-            bot.send_message(ADMIN_ID,
-                "🚨 <b>DONGVANFB_API_KEY সেট করা নেই!</b>\n\nCode fetch feature কাজ করবে না যতক্ষণ না এই environment variable সেট করা হয়।",
-                parse_mode="HTML")
-        except Exception:
-            pass
+    started = _otp_busy.get(user_id)
+    if started and (_time_module.time() - started) < (OTP_WAIT_MAX_SEC + 30):
+        bot.send_message(user_id, "⏳ আপনার আগের চেক এখনো চলছে, একটু অপেক্ষা করুন।",
+                         reply_markup=get_main_menu(user_id))
         return
-
-    wait_msg = bot.send_message(
-        user_id,
-        "⏳ <b>Fetching code...</b>\n\n"
-        "⏱ Wait for OTP max <b>30s</b>",
-        parse_mode="HTML"
-    )
-
-    url = "https://tools.dongvanfb.net/api/get_code_oauth2"
-    payload = {
-        "email": email,
-        "refresh_token": refresh_token,
-        "client_id": client_id,
-        "type": "all",
-        "apikey": DONGVANFB_API_KEY
-    }
-    headers = {
-        "Content-Type": "application/json"
-    }
-
-    found = None
-    elapsed = 0
-    _last_debug = ""
-
-    while elapsed < 30:
-        try:
-            resp = http_requests.post(url, json=payload, headers=headers, timeout=10)
-            data = resp.json()
-            # ⚡ প্রতিটা attempt এর raw response log করো — কোনো OTP না
-            # পাওয়া গেলে exact কারণ (wrong key/token, provider error,
-            # rate limit ইত্যাদি) log থেকে বোঝা যাবে
-            _last_debug = f"HTTP={resp.status_code} body={str(data)[:300]}"
-            logging.info(f"dongvanfb code fetch [{email}]: {_last_debug}")
-            # code অথবা content যেকোনো একটা থাকলেই found ধরো
-            if data.get("status") and (
-                data.get("code") or data.get("content") or data.get("data")
-            ):
-                found = data
-                break
-        except Exception as e:
-            _last_debug = f"exception: {e}"
-            logging.warning(f"Code fetch error [{email}]: {e}")
-        _time.sleep(5)
-        elapsed += 5
-
+    _otp_busy[user_id] = _time_module.time()
+    wait_msg = None
     try:
-        bot.delete_message(user_id, wait_msg.message_id)
-    except:
-        pass
-
-    if found:
-        code    = (found.get("code") or "").strip()
-        content = (found.get("content") or "").strip()
-        subject = (found.get("subject") or found.get("title") or "").strip()
-        sender  = (found.get("sender") or found.get("from") or "").strip()
-
-        # data field এ থাকলে সেখান থেকেও বের করো
-        if not code and not content and found.get("data"):
-            raw_data = found["data"]
-            if isinstance(raw_data, list) and raw_data:
-                first = raw_data[0]
-                if isinstance(first, dict):
-                    code    = (first.get("code") or "").strip()
-                    content = (first.get("content") or first.get("body") or "").strip()
-                    subject = (first.get("subject") or first.get("title") or subject).strip()
-                    sender  = (first.get("sender") or first.get("from") or sender).strip()
-            elif isinstance(raw_data, dict):
-                code    = (raw_data.get("code") or "").strip()
-                content = (raw_data.get("content") or raw_data.get("body") or "").strip()
-                subject = (raw_data.get("subject") or raw_data.get("title") or subject).strip()
-                sender  = (raw_data.get("sender") or raw_data.get("from") or sender).strip()
-            elif isinstance(raw_data, str):
-                content = raw_data.strip()
-
-        links = re.findall(r'https?://\S+', content) if content else []
-
-        # Service detect: sender > subject > link > content > email (priority order)
-        service = _detect_service_type(sender, subject, links[0] if links else None, content, email)
-        service_line = f"🏷️ <b>Type :</b> {service}\n" if service else ""
-
-        if code:
-            bot.send_message(
-                user_id,
-                f"✅ <b>OTP Found!</b>\n\n"
-                f"📧 <b>Email :</b> <code>{email}</code>\n"
-                f"{service_line}"
-                f"🔑 <b>OTP :</b> <code>{code}</code>",
-                parse_mode="HTML",
-                reply_markup=get_main_menu(user_id)
-            )
-        elif links:
-            bot.send_message(
-                user_id,
-                f"✅ <b>Link Found!</b>\n\n"
-                f"📧 <b>Email :</b> <code>{email}</code>\n"
-                f"{service_line}"
-                f"🔗 <b>Link :</b> {links[0]}",
-                parse_mode="HTML",
-                reply_markup=get_main_menu(user_id)
-            )
-        elif content:
-            bot.send_message(
-                user_id,
-                f"✅ <b>Message Found!</b>\n\n"
-                f"📧 <b>Email :</b> <code>{email}</code>\n"
-                f"{service_line}"
-                f"📨 <b>Content :</b> {content[:500]}",
-                parse_mode="HTML",
-                reply_markup=get_main_menu(user_id)
-            )
-        else:
-            bot.send_message(
-                user_id,
-                f"⚠️ <b>Response পাওয়া গেছে কিন্তু code/link খালি!</b>\n\n"
-                f"📧 <b>Email :</b> <code>{email}</code>\n\n"
-                f"Inbox এ নতুন mail নেই বা code/link নেই।",
-                parse_mode="HTML",
-                reply_markup=get_main_menu(user_id)
-            )
-    else:
-        bot.send_message(
+        _w_th, _w_box = _send_wait_async(
             user_id,
-            f"❌ <b>Code পাওয়া যায়নি!</b>\n\n"
-            f"📧 <b>Email :</b> <code>{email}</code>\n\n"
-            f"⏱ 30 সেকেন্ডে কোনো code আসেনি।\n"
-            f"একটু পরে আবার চেষ্টা করুন।",
-            parse_mode="HTML",
-            reply_markup=get_main_menu(user_id)
-        )
-        # ⚡ Admin কে actual API response পাঠাও — silent fail এর বদলে
-        # আসল কারণ (wrong key/token, provider error, inbox empty ইত্যাদি) দেখা যাবে
+            f"⏳ <b>Fetching code...</b>\n\n⏱ Wait for OTP max <b>{OTP_WAIT_MAX_SEC}s</b>")
+        found, seen_msgs, err, kind, rounds = mailgen_poll_for_code(full_data, tag=f"code uid={user_id}")
+        _delete_wait_async(user_id, _w_th, _w_box)
+        if found:
+            _otp_send_result(user_id, email, found)
+            # inline বাটনের সাথে reply-keyboard একই মেসেজে দেওয়া যায় না — আলাদা করে মেইন মেনু
+            bot.send_message(user_id, t(user_id, "main_menu"),
+                             reply_markup=get_main_menu(user_id), parse_mode="HTML")
+        elif (not seen_msgs) and err and kind != "ok":
+            bot.send_message(user_id, _otp_failed_text(email, kind),
+                             parse_mode="HTML", reply_markup=get_main_menu(user_id))
+            _otp_report_failure(user_id, email, err, kind)
+        else:
+            bot.send_message(user_id,
+                _otp_not_found_text(email, seen_msgs, err, kind, show_debug=is_admin(user_id),
+                                    retry_hint="আবার 💻 Code</> চাপুন"),
+                parse_mode="HTML", reply_markup=get_main_menu(user_id))
+    except Exception as e:
+        logging.error(f"_do_code_fetch error: {e}")
         try:
-            bot.send_message(ADMIN_ID,
-                f"🔍 <b>Code Fetch Debug</b>\n\n"
-                f"📧 Email: <code>{email}</code>\n"
-                f"👤 User: <code>{user_id}</code>\n"
-                f"📄 Last API response: <code>{_last_debug[:500]}</code>",
-                parse_mode="HTML")
+            bot.send_message(user_id, "❌ কিছু একটা সমস্যা হয়েছে, আবার চেষ্টা করুন।",
+                             reply_markup=get_main_menu(user_id))
         except Exception:
             pass
+    finally:
+        _otp_busy.pop(user_id, None)
 
 # ═══════════════════════════════════════════════════════════
 # 🔗 FEATURE: /tn_verify COMMAND — Get Link from Inbox (OAuth2)
@@ -33563,7 +33925,8 @@ def process_tn_verify_input(message):
         "client_id": client_id
     }
 
-    _EXECUTOR.submit(_do_tn_verify_fetch, user_id, email, refresh_token, client_id)
+    threading.Thread(target=_do_tn_verify_fetch, args=(user_id, email, refresh_token, client_id),
+                     daemon=True, name=f"tn_verify_{user_id}").start()
 
 
 # FIX: clicks.textnow.com (এবং যেকোনো *.textnow.com subdomain) ধরার জন্য প্রথমে
@@ -33671,18 +34034,18 @@ def _do_tn_verify_fetch(user_id, email, refresh_token, client_id):
     wait_msg = bot.send_message(
         user_id,
         "⏳ <b>Inbox check করা হচ্ছে...</b>\n\n"
-        "⏱ Wait for link max <b>30s</b>",
+        f"⏱ Wait for link max <b>{OTP_WAIT_MAX_SEC}s</b>",
         parse_mode="HTML"
     )
 
-    url = "https://tools.dongvanfb.net/api/get_messages_oauth2"
-    payload = {
-        "email": email,
-        "refresh_token": refresh_token,
-        "client_id": client_id,
-        "list_mail": "all"
-    }
-    headers = {"Content-Type": "application/json"}
+    # ✅ Mailgen API (tools.dongvanfb.net বাদ) — password সেশন থেকে (inbox-read fallback এর জন্য)
+    _sess = _tn_verify_session.get(str(user_id)) or {}
+    _pw = (_sess.get("password") or "") if _sess.get("email") == email else ""
+    full_data = "|".join([email, _pw, refresh_token, client_id])
+    _t0 = _time.time()
+    _deadline = _t0 + OTP_WAIT_MAX_SEC + MG_FINAL_GRACE
+    _round = 0
+    _bad_hits = 0
 
     found_link    = None
     found_subject = None
@@ -33693,16 +34056,24 @@ def _do_tn_verify_fetch(user_id, email, refresh_token, client_id):
     SKIP_KEYWORDS = ["open_log_pic", "pixel", "track", "beacon", "1x1", "spacer",
                      "unsubscribe", "email_open_log", "logo", ".png", ".jpg", ".gif"]
 
-    while elapsed < 30:
+    while elapsed < OTP_WAIT_MAX_SEC:
         try:
-            resp = http_requests.post(url, json=payload, headers=headers, timeout=10)
-            data = resp.json()
-            logging.info(f"TN verify API response: status={data.get('status')} keys={list(data.keys())}")
+            messages, _mg_err, _mg_kind = mailgen_fetch_messages(
+                full_data, deep=(_round % 4 == 0), deadline=_deadline)
+            _round += 1
+            logging.info(f"TN verify Mailgen: msgs={len(messages)} kind={_mg_kind} err={_mg_err!r}")
+            # টোকেন/API-key সমস্যা বা breaker খোলা — বসে না থেকে সঙ্গে সঙ্গে থামো
+            if not messages and _mg_kind in ("apikey", "breaker"):
+                break
+            if not messages and _mg_kind in ("cred", "client"):
+                _bad_hits += 1
+                if _bad_hits >= 2:
+                    break
+            else:
+                _bad_hits = 0
 
-            if data.get("status") is True or data.get("status") == "true" or data.get("status") == 1:
-                # API documentation অনুযায়ী: messages → list
-                messages = data.get("messages") or data.get("data") or data.get("emails") or data.get("list") or []
-
+            if messages:
+                # Mailgen মেসেজ normalized: subject / from (string) / message (raw HTML সহ পূর্ণ body)
                 if isinstance(messages, list):
                     for mail in messages:
                         if not isinstance(mail, dict):
@@ -33841,8 +34212,8 @@ def _do_tn_verify_fetch(user_id, email, refresh_token, client_id):
         except Exception as e:
             logging.warning(f"TN verify fetch error: {e}")
 
-        _time.sleep(5)
-        elapsed += 5
+        _time.sleep(4)
+        elapsed = _time.time() - _t0
 
     try:
         bot.delete_message(user_id, wait_msg.message_id)
@@ -33879,7 +34250,7 @@ def _do_tn_verify_fetch(user_id, email, refresh_token, client_id):
             user_id,
             f"❌ <b>Link পাওয়া যায়নি!</b>\n\n"
             f"📧 <b>Email:</b> <code>{email}</code>\n\n"
-            f"⏱ 30 সেকেন্ডে inbox এ কোনো link আসেনি।\n"
+            f"⏱ {OTP_WAIT_MAX_SEC} সেকেন্ডে inbox এ কোনো link আসেনি।\n"
             f"একটু পরে আবার চেষ্টা করুন।",
             parse_mode="HTML",
             reply_markup=get_main_menu(user_id)
@@ -33939,15 +34310,17 @@ def cmd_otpdebug(message):
             rows.append(f"• {_hx(str(m.get('from') or '')[:20])} | {_hx(str(m.get('subject') or '')[:45])} | code={_hx(m.get('code') or '-')} | {_hx(m.get('date') or '')}")
         return "\n".join(rows) or "(কোনো মেসেজ নেই)"
     out = [f"📧 <code>{_hx(fd.split('|')[0])}</code> (parts={fd.count('|') + 1})"]
-    dvm, dve = _dongvan_get_messages(fd)
-    out.append(f"0️⃣ <b>dongvanfb</b> err={_hx(dve)}\ncount={len(dvm)}\n{_brief(dvm)}")
+    mgm, mge, mgk = mailgen_fetch_messages(fd, deep=True)
+    out.append(f"0️⃣ <b>Mailgen fetch (auto strategy)</b> kind={_hx(mgk)} err={_hx(mge)} "
+               f"mode_pref={_hx(_mg_mode_pref.get(fd.split('|')[0].strip().lower(), 'oauth'))}\n"
+               f"count={len(mgm)}\n{_brief(mgm)}")
     d, e = mailgen_inbox_read(fd)
     out.append(f"1️⃣ <b>inbox-read</b> err={_hx(e)}\ntotal={(d or {}).get('totalMessages')}\n{_brief((d or {}).get('messages'))}")
     for mode in ("oauth", "graph"):
         ms, e2 = _mailgen_get_inbox_try(fd, mode)
         out.append(f"2️⃣ <b>get-inbox [{mode}]</b> err={_hx(e2)}\ncount={len(ms)}\n{_brief(ms)}")
     allm = (((d or {}).get('messages')) or [])
-    found = _otp_scan_messages(dvm) or _otp_scan_messages(allm) or _otp_scan_messages(mailgen_get_inbox_full(fd))
+    found = _otp_scan_messages(mgm) or _otp_scan_messages(allm)
     out.append("🔎 Parser: " + (f"code=<code>{_hx(found[1])}</code> links={len(found[2])}" if found else "কিছু পায়নি"))
     bot.send_message(uid, "\n\n".join(out)[:4000], parse_mode="HTML")
 
@@ -35742,6 +36115,7 @@ if __name__ == "__main__":
     print(f"🚀 Threaded Mode: ON (16 threads + ThreadPoolExecutor)")
     print(f"💾 DB Cache TTL: {_DB_CACHE_TTL}s")
     print(f"📦 Stock Cache TTL: {_STOCK_CACHE_TTL}s")
+    print(f"📮 Mailgen API: {'key set ✅' if MAILGEN_API_KEY else '⚠️ MAILGEN_API_KEY সেট নেই — Get OTP / Code কাজ করবে না!'}")
     print(f"⚡ Callback ACK: INSTANT (pre-answer + thread pool)")
     print("=" * 60)
 
