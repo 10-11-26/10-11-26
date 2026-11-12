@@ -1394,7 +1394,6 @@ def _cw_generic_crash_handler(call, handler_name, e):
                                         f"button={getattr(call, 'data', '?')} | err={e}\n\n{tb[-1200:]}")
         except Exception:
             pass
-DONGVANFB_API_KEY = os.environ.get('DONGVANFB_API_KEY', '')
 
 # ===========================
 # SECURITY CONFIG
@@ -18404,11 +18403,11 @@ def mailgen_inbox_read(full_data, message_count=20):
 #    /api/inbox-read কল হয়; কোড বা verify link না আসা পর্যন্ত নিজে থেকেই
 #    কিছুক্ষণ পরপর চেক করে, আসলেই বটে পাঠিয়ে দেয়।
 # ═══════════════════════════════════════════════════════════
-# ✅ ক্রম: আগে dongvanfb (OTP_DV_PHASE_SEC সেকেন্ড), না পেলে MailGen (OTP_MG_PHASE_SEC সেকেন্ড)
-OTP_DV_PHASE_SEC      = 15     # dongvanfb থেকে কোড খোঁজার সময়
+# ✅ ক্রম: আগে Microsoft Graph API (OTP_GRAPH_PHASE_SEC সেকেন্ড), না পেলে MailGen (OTP_MG_PHASE_SEC সেকেন্ড)
+OTP_GRAPH_PHASE_SEC   = 15     # Graph API থেকে কোড খোঁজার সময়
 OTP_MG_PHASE_SEC      = 15     # তারপর MailGen থেকে কোড খোঁজার সময়
-OTP_WAIT_MAX_SEC      = OTP_DV_PHASE_SEC + OTP_MG_PHASE_SEC   # মোট (ইউজারকে দেখানো সংখ্যা)
-OTP_DV_INTERVAL_SEC   = 3      # dongvanfb প্রতি কত সেকেন্ড পরপর চেক
+OTP_WAIT_MAX_SEC      = OTP_GRAPH_PHASE_SEC + OTP_MG_PHASE_SEC   # মোট (ইউজারকে দেখানো সংখ্যা)
+OTP_GRAPH_INTERVAL_SEC = 3     # Graph API প্রতি কত সেকেন্ড পরপর চেক
 OTP_CHECK_INTERVAL_SEC = 2     # MailGen প্রতি কত সেকেন্ড পরপর চেক
 OTP_MAX_API_ERRORS    = 3      # (পুরোনো কনস্ট্যান্ট — সামঞ্জস্যের জন্য রাখা)
 OTP_MAX_AGE_SEC       = 1800   # ৩০ মিনিটের পুরোনো কোড (তারিখ নিশ্চিত হলে) দেখাবে না
@@ -18574,59 +18573,125 @@ def _build_otp_copy_button(code):
     except Exception:
         return InlineBtn(f"📋 {code}", style=_ik("inline_otp_code"), callback_data=f"2fa_showcode_{code}")
 
-DONGVAN_MSG_URL = "https://tools.dongvanfb.net/api/get_messages_oauth2"
-
 def _strip_html(t):
     t = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", str(t or ""))
     t = re.sub(r"(?s)<[^>]+>", " ", t)
     import html as _h
     return re.sub(r"\s+", " ", _h.unescape(t)).strip()
 
-def _dongvan_get_messages(full_data, timeout=20):
-    """dongvanfb get_messages_oauth2 (API key লাগে না) — Hotmail/Outlook token
-    (email|password|refresh_token|client_id) দিয়ে ইনবক্স পড়ে। MailGen ব্যর্থ হলেও
-    এই একই ধরনের token এ এটা সাধারণত কাজ করে।
-    রিটার্ন: (messages_list_normalized, error_or_None)।"""
+# ═══════════════════════════════════════════════════════════
+# 📬 Microsoft Graph API — Hotmail/Outlook inbox read
+# full_data = email|password|refresh_token|client_id  →  refresh_token দিয়ে access_token
+# নিয়ে সরাসরি graph.microsoft.com/v1.0/me/messages থেকে ইনবক্স পড়ে (তৃতীয় পক্ষের API লাগে না)।
+# ═══════════════════════════════════════════════════════════
+GRAPH_TOKEN_URLS = (
+    "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
+    "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+)
+GRAPH_MAIL_URL = "https://graph.microsoft.com/v1.0/me/messages"
+GRAPH_SCOPE_TRIES = ("Mail.Read Mail.ReadBasic", "https://graph.microsoft.com/.default", "")
+_graph_tok_cache = {}   # (client_id, refresh_token) -> (access_token, expiry_ts)
+_graph_tok_fail = {}    # (client_id, refresh_token) -> (ts, error)  — ২০ সেকেন্ড negative cache
+_graph_tok_lock = threading.Lock()
+
+def _graph_access_token(client_id, refresh_token, force=False):
+    """refresh_token → access_token (cache সহ)। রিটার্ন: (token_or_None, error_or_None)।"""
+    key = (client_id, refresh_token)
+    now = _time_module.time()
+    with _graph_tok_lock:
+        if force:
+            _graph_tok_cache.pop(key, None)
+        else:
+            c = _graph_tok_cache.get(key)
+            if c and c[1] > now + 60:
+                return c[0], None
+            f = _graph_tok_fail.get(key)
+            if f and (now - f[0]) < 20:
+                return None, f[1]
+    last_err = "unknown"
+    for url in GRAPH_TOKEN_URLS:
+        for scope in GRAPH_SCOPE_TRIES:
+            data = {"client_id": client_id, "grant_type": "refresh_token", "refresh_token": refresh_token}
+            if scope:
+                data["scope"] = scope
+            try:
+                resp = http_requests.post(url, data=data, timeout=15)
+            except Exception as e:
+                last_err = f"{type(e).__name__}: {e}"[:150]
+                continue
+            try:
+                j = resp.json()
+            except Exception:
+                j = {}
+            at = j.get("access_token") if resp.status_code == 200 else None
+            if at:
+                exp = now + int(j.get("expires_in") or 3600)
+                with _graph_tok_lock:
+                    if len(_graph_tok_cache) > 500:
+                        for k in [k for k, v in _graph_tok_cache.items() if v[1] < now]:
+                            _graph_tok_cache.pop(k, None)
+                    _graph_tok_cache[key] = (at, exp)
+                    _graph_tok_fail.pop(key, None)
+                return at, None
+            last_err = str(j.get("error_description") or j.get("error") or resp.text[:150]).split("\r\n")[0][:150]
+    with _graph_tok_lock:
+        if len(_graph_tok_fail) > 500:
+            _graph_tok_fail.clear()
+        _graph_tok_fail[key] = (now, last_err)
+    return None, last_err
+
+def _graph_inbox_messages(full_data, timeout=20, top=10):
+    """Microsoft Graph API দিয়ে ইনবক্স (সব ফোল্ডার, নতুন আগে) পড়ে — email|pass|refresh_token|client_id।
+    রিটার্ন: (messages_list_normalized, error_or_None)। error 'token:' দিয়ে শুরু হলে token/অ্যাকাউন্ট সমস্যা।"""
     try:
-        parts = [x.strip() for x in full_data.split("|")]
-        if len(parts) < 4:
+        parts = [x.strip() for x in str(full_data or "").split("|")]
+        if len(parts) < 4 or not parts[2] or not parts[3]:
             return [], "token/client_id নেই"
-        payload = {"email": parts[0], "refresh_token": parts[2],
-                   "client_id": parts[3], "list_mail": "all"}
-        resp = http_requests.post(DONGVAN_MSG_URL, json=payload,
-                                  headers={"Content-Type": "application/json"}, timeout=timeout)
-        try:
-            data = resp.json()
-        except Exception:
-            return [], f"non-JSON (HTTP {resp.status_code})"
-        st = data.get("status")
-        if not (st is True or st == 1 or str(st).lower() == "true"):
-            return [], str(data.get("content") or data.get("message") or data.get("error") or data)[:120]
-        raw = data.get("messages") or data.get("data") or data.get("emails") or data.get("list") or []
+        refresh_token, client_id = parts[2], parts[3]
+        params = {
+            "$top": str(top),
+            "$orderby": "receivedDateTime desc",
+            "$select": "subject,bodyPreview,body,from,receivedDateTime",
+        }
+        resp = None
+        for force in (False, True):          # 401 এলে একবার নতুন token নিয়ে আবার
+            at, terr = _graph_access_token(client_id, refresh_token, force=force)
+            if not at:
+                return [], f"token: {terr}"
+            resp = http_requests.get(GRAPH_MAIL_URL, headers={"Authorization": f"Bearer {at}"},
+                                     params=params, timeout=timeout)
+            if resp.status_code != 401:
+                break
+        if resp.status_code != 200:
+            try:
+                em = (resp.json().get("error") or {}).get("message")
+            except Exception:
+                em = None
+            return [], f"graph HTTP {resp.status_code}: {str(em or resp.text)[:120]}"
         out = []
-        for mail in raw if isinstance(raw, list) else []:
+        for mail in (resp.json().get("value") or []):
             if not isinstance(mail, dict):
                 continue
-            fr = mail.get("from") or mail.get("sender") or ""
-            if isinstance(fr, list) and fr:
-                f0 = fr[0]
-                fr = (f0.get("name") or f0.get("address") or "") if isinstance(f0, dict) else str(f0)
-            elif isinstance(fr, dict):
-                fr = fr.get("name") or fr.get("address") or ""
-            body = " ".join(str(mail.get(k)) for k in ("message", "body", "html", "html_body", "content", "text") if mail.get(k))
+            ea = ((mail.get("from") or {}).get("emailAddress") or {})
+            nm, ad = str(ea.get("name") or "").strip(), str(ea.get("address") or "").strip()
+            frm = f"{nm} <{ad}>" if (nm and ad and nm.lower() != ad.lower()) else (ad or nm)
+            html_body = str((mail.get("body") or {}).get("content") or "")
+            plain = _strip_html(html_body) or str(mail.get("bodyPreview") or "")
+            # CSS/hex রঙের সংখ্যা ভুল OTP হিসেবে না ধরতে: message = plain text + href লিংকগুলো
+            import html as _h
+            hrefs = [_h.unescape(u) for u in re.findall(r'href=["\'](https?://[^"\']+)', html_body, re.I)]
+            date = str(mail.get("receivedDateTime") or "")
             out.append({
-                "subject": str(mail.get("subject") or mail.get("title") or ""),
-                "from": str(fr),
-                "date": str(mail.get("date") or ""),
-                "code": str(mail.get("code") or "").strip(),
-                "_ts": _otp_parse_ts(mail.get("date")),   # timezone-সহ তারিখ হলে epoch, নাহলে None
-                "message": body,                      # লিংক খোঁজার জন্য raw HTML সহ
-                "preview": _strip_html(body)[:300],   # ইউজারকে দেখানোর জন্য পরিষ্কার text
+                "subject": str(mail.get("subject") or ""),
+                "from": frm,
+                "date": date,
+                "code": "",
+                "_ts": _otp_parse_ts(date),
+                "message": plain + ("\n" + "\n".join(hrefs) if hrefs else ""),
+                "html": html_body,                 # raw HTML (TN verify এর anchor খোঁজার জন্য)
+                "preview": plain[:300],
             })
-        # নতুন আগে সাজাও (date পার্স করা গেলে)
-        if out and all(m.get("_ts") for m in out):
-            out.sort(key=lambda m: m["_ts"], reverse=True)
-        logging.info(f"dongvanfb get_messages_oauth2 → {len(out)} msgs")
+        logging.info(f"Graph /me/messages → {len(out)} msgs")
         return out, None
     except Exception as e:
         return [], f"{type(e).__name__}: {e}"
@@ -18738,7 +18803,7 @@ def handle_get_otp_from_keyboard(user_id, db):
                      daemon=True, name=f"otp_check_{user_id}").start()
 
 def _otp_check_worker(user_id, email, full_data):
-    """প্রথমে dongvanfb থেকে OTP_DV_PHASE_SEC সেকেন্ড ধরে চেক করে; না পেলে MailGen থেকে
+    """প্রথমে Graph API থেকে OTP_GRAPH_PHASE_SEC সেকেন্ড ধরে চেক করে; না পেলে MailGen থেকে
     OTP_MG_PHASE_SEC সেকেন্ড ধরে। কোড/verify link পেলে সাথে সাথে পাঠিয়ে থামে।"""
     kb = get_product_buy_keyboard(user_id)
     wait_msg = None
@@ -18747,24 +18812,26 @@ def _otp_check_worker(user_id, email, full_data):
             user_id, f"⏳ <b>Inbox চেক হচ্ছে...</b>\n📧 <code>{_hx(email)}</code>", parse_mode="HTML")
         found = None
         seen_msgs = []          # সর্বশেষ যে মেসেজ লিস্ট পাওয়া গেছে (কোড না পেলে ইউজারকে দেখানোর জন্য)
-        dv_err = err = full_err = None
+        gr_err = err = full_err = None
         mg_ran = False
 
-        # ── ধাপ ১: dongvanfb ──
+        # ── ধাপ ১: Microsoft Graph API ──
         p1 = _time_module.time()
         while True:
-            msgs, dv_err = _dongvan_get_messages(full_data, timeout=10)
+            msgs, gr_err = _graph_inbox_messages(full_data, timeout=10)
             if msgs:
                 seen_msgs = msgs
                 found = _otp_scan_messages(msgs, max_age=OTP_MAX_AGE_SEC)
-            logging.info(f"OTP[dongvanfb] uid={user_id}: msgs={len(msgs)} err={dv_err!r} found={bool(found)}")
+            logging.info(f"OTP[graph] uid={user_id}: msgs={len(msgs)} err={gr_err!r} found={bool(found)}")
             if found:
                 break
-            if (_time_module.time() - p1) + OTP_DV_INTERVAL_SEC >= OTP_DV_PHASE_SEC:
+            if not msgs and str(gr_err or "").startswith("token:"):
+                break    # token/অ্যাকাউন্ট সমস্যা — Graph এ আর অপেক্ষা না করে MailGen fallback
+            if (_time_module.time() - p1) + OTP_GRAPH_INTERVAL_SEC >= OTP_GRAPH_PHASE_SEC:
                 break
-            _time_module.sleep(OTP_DV_INTERVAL_SEC)
+            _time_module.sleep(OTP_GRAPH_INTERVAL_SEC)
 
-        # ── ধাপ ২: MailGen (dongvanfb এ না পেলে) ──
+        # ── ধাপ ২: MailGen (Graph এ না পেলে) ──
         if not found:
             mg_ran = True
             p2 = _time_module.time()
@@ -18786,7 +18853,7 @@ def _otp_check_worker(user_id, email, full_data):
         except Exception:
             pass
 
-        all_failed = (not seen_msgs) and bool(dv_err) and mg_ran and bool(err) and bool(full_err)
+        all_failed = (not seen_msgs) and bool(gr_err) and mg_ran and bool(err) and bool(full_err)
         if found:
             _otp_send_result(user_id, email, found)
         elif all_failed:
@@ -18803,7 +18870,7 @@ def _otp_check_worker(user_id, email, full_data):
                     bot.send_message(ADMIN_ID,
                         f"🔍 <b>OTP Inbox Error</b>\n\n👤 User: <code>{user_id}</code>\n"
                         f"📧 <code>{_hx(email)}</code>\n"
-                        f"<i>{_hx(str(dv_err)[:120])} / {_hx(str(err)[:120])}</i>",
+                        f"<i>{_hx(str(gr_err)[:120])} / {_hx(str(err)[:120])}</i>",
                         parse_mode="HTML")
             except Exception:
                 pass
@@ -18818,7 +18885,7 @@ def _otp_check_worker(user_id, email, full_data):
                              f"({_hx(_otp_fmt_time(m0.get('date')))})"
                              + (f"\n<code>{_hx(_pv)}</code>" if _pv else ""))
                 elif is_admin(user_id):
-                    extra = (f"\n\n🛠 <i>Debug:</i> মেসেজ 0 — dongvanfb err={_hx(dv_err)}, inbox-read err={_hx(err)}, "
+                    extra = (f"\n\n🛠 <i>Debug:</i> মেসেজ 0 — graph err={_hx(gr_err)}, inbox-read err={_hx(err)}, "
                              f"get-inbox err={_hx(full_err)} (বিস্তারিত: /otpdebug)")
             except Exception:
                 extra = ""
@@ -33044,7 +33111,7 @@ def handle_stock_command(message):
 
 
 # ═══════════════════════════════════════════════════════════
-# 📧 FEATURE 7: /token COMMAND — DongvanFB Mail Reader
+# 📧 FEATURE 7: /token COMMAND — Mail Reader (Graph API, /code flow এ যায়)
 # ═══════════════════════════════════════════════════════════
 
 import requests as _req_lib
@@ -33069,29 +33136,11 @@ def handle_get_code_command(message):
     if user_id in db.get("banned_users", []):
         return
 
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(
-        InlineBtn("📨 Hotmail & Outlook code", style="primary", url="https://dongvanfb.net/read_mail_box"),
-        InlineBtn("🏠 Main Menu", style="primary", callback_data="back_to_main"))
-
-    bot.send_message(user_id,
-        "🔑 <b>Get Code — Tools</b>\n\n"
-        "\n"
-        "নিচের বাটনে ক্লিক করে সরাসরি সাইটে যান:\n"
-        "",
-        parse_mode="HTML",
-        reply_markup=markup)
+    handle_code_command(message)    # Graph API দিয়ে বটের ভেতরেই কোড আনে
 
 def process_token_data(message):
-    """Legacy handler - no longer used, /token now opens website."""
-    user_id = str(message.chat.id)
-    markup = types.InlineKeyboardMarkup()
-    markup.add(InlineBtn(
-        "🌐 Mail Box খুলুন", style="primary", url="https://dongvanfb.net/read_mail_box"))
-    bot.send_message(user_id,
-        "📧 <b>Mail Box Reader</b>\n\n"
-        "নিচের বাটনে ক্লিক করে Mail Box খুলুন:",
-        parse_mode="HTML", reply_markup=markup)
+    """Legacy handler - এখন /code ফ্লোতে যায়।"""
+    handle_code_command(message)
 
 
 def _do_token_fetch(user_id, email, refresh_token, client_id):
@@ -33262,7 +33311,7 @@ def _token_retry_worker_impl(call):
 
 
 # ═══════════════════════════════════════════════════════════
-# 📧 FEATURE: /code COMMAND — Get OTP via OAuth2 (dongvanfb)
+# 📧 FEATURE: /code COMMAND — Get OTP via Microsoft Graph API
 # ═══════════════════════════════════════════════════════════
 
 _code_session = {}
@@ -33428,47 +33477,9 @@ def _detect_service_type(*texts):
     return None
 
 
-def _dv_code_oauth2(email, refresh_token, client_id):
-    """dongvanfb get_code_oauth2 — DONGVANFB_API_KEY সেট থাকলেই চলে (আপনার key সরাসরি কোডে/ENV এ বসালে)।
-    রিটার্ন: (found_tuple_or_None, debug_str)। found = (msg, code, links) — _otp_send_result এর ফরম্যাট।"""
-    if not DONGVANFB_API_KEY:
-        return None, "no-key"
-    try:
-        resp = http_requests.post(
-            "https://tools.dongvanfb.net/api/get_code_oauth2",
-            json={"email": email, "refresh_token": refresh_token, "client_id": client_id,
-                  "type": "all", "apikey": DONGVANFB_API_KEY},
-            headers={"Content-Type": "application/json"}, timeout=10)
-        data = resp.json()
-        dbg = f"HTTP={resp.status_code} body={str(data)[:200]}"
-        if not data.get("status"):
-            return None, dbg
-        raw = data.get("data")
-        if isinstance(raw, list) and raw and isinstance(raw[0], dict):
-            raw = raw[0]
-        src = raw if isinstance(raw, dict) else data
-        code = str(src.get("code") or data.get("code") or "").strip()
-        content = str(src.get("content") or data.get("content") or (raw if isinstance(raw, str) else "") or "").strip()
-        subject = str(src.get("subject") or src.get("title") or data.get("subject") or "").strip()
-        sender = str(src.get("sender") or src.get("from") or data.get("sender") or data.get("from") or "").strip()
-        date = str(src.get("date") or data.get("date") or "")
-        if not (code or content):
-            return None, dbg
-        msg = {"subject": subject, "from": sender, "date": date, "code": code,
-               "_ts": _otp_parse_ts(date), "message": content, "preview": _strip_html(content)[:300]}
-        if not code:
-            code = _extract_otp_from_msg(msg) or ""
-        links = [] if code else _extract_links_from_msg(msg)
-        if not (code or links):
-            return None, dbg
-        return (msg, code, links), dbg
-    except Exception as e:
-        return None, f"exception: {e}"
-
-
 def _do_code_fetch(user_id, email, refresh_token, client_id):
     """/code এবং 💻 Code</> বাটন — কোনো API key লাগে না।
-    আগে dongvanfb (key ছাড়া get_messages_oauth2), না পেলে MailGen (পাবলিক API) দিয়ে ইনবক্স পড়ে।"""
+    আগে Microsoft Graph API দিয়ে, না পেলে MailGen (পাবলিক API) দিয়ে ইনবক্স পড়ে।"""
     user_id = str(user_id)
     sess = _code_session.get(user_id) or {}
     password = (sess.get("password") or "") if sess.get("email") == email else ""
@@ -33488,28 +33499,24 @@ def _do_code_fetch(user_id, email, refresh_token, client_id):
             parse_mode="HTML")
         found = None
         seen_msgs = []
-        dv_err = err = full_err = None
+        gr_err = err = full_err = None
         mg_ran = False
 
-        # ── ধাপ ১: dongvanfb (key থাকলে key সহ, নাহলে key ছাড়া) ──
+        # ── ধাপ ১: Microsoft Graph API ──
         p1 = _time_module.time()
         while True:
-            # DONGVANFB_API_KEY বসানো থাকলে আগে get_code_oauth2 (key সহ); নাহলে/না পেলে key ছাড়া ইনবক্স পড়া
-            if DONGVANFB_API_KEY:
-                found, _kdbg = _dv_code_oauth2(email, refresh_token, client_id)
-                logging.info(f"CODE[dongvanfb-key] uid={user_id}: found={bool(found)} {_kdbg}")
-                if found:
-                    break
-            msgs, dv_err = _dongvan_get_messages(full_data, timeout=10)
+            msgs, gr_err = _graph_inbox_messages(full_data, timeout=10)
             if msgs:
                 seen_msgs = msgs
                 found = _otp_scan_messages(msgs, max_age=OTP_MAX_AGE_SEC)
-            logging.info(f"CODE[dongvanfb] uid={user_id}: msgs={len(msgs)} err={dv_err!r} found={bool(found)}")
+            logging.info(f"CODE[graph] uid={user_id}: msgs={len(msgs)} err={gr_err!r} found={bool(found)}")
             if found:
                 break
-            if (_time_module.time() - p1) + OTP_DV_INTERVAL_SEC >= OTP_DV_PHASE_SEC:
+            if not msgs and str(gr_err or "").startswith("token:"):
+                break    # token/অ্যাকাউন্ট সমস্যা — Graph এ আর অপেক্ষা না করে MailGen fallback
+            if (_time_module.time() - p1) + OTP_GRAPH_INTERVAL_SEC >= OTP_GRAPH_PHASE_SEC:
                 break
-            _time_module.sleep(OTP_DV_INTERVAL_SEC)
+            _time_module.sleep(OTP_GRAPH_INTERVAL_SEC)
 
         # ── ধাপ ২: MailGen (পাবলিক API, key লাগে না) ──
         if not found:
@@ -33533,7 +33540,7 @@ def _do_code_fetch(user_id, email, refresh_token, client_id):
         except Exception:
             pass
 
-        all_failed = (not seen_msgs) and bool(dv_err) and mg_ran and bool(err) and bool(full_err)
+        all_failed = (not seen_msgs) and bool(gr_err) and mg_ran and bool(err) and bool(full_err)
         if found:
             _otp_send_result(user_id, email, found)
             bot.send_message(user_id, t(user_id, "main_menu"),
@@ -33551,7 +33558,7 @@ def _do_code_fetch(user_id, email, refresh_token, client_id):
                     bot.send_message(ADMIN_ID,
                         f"🔍 <b>Code Fetch Error</b>\n\n👤 User: <code>{user_id}</code>\n"
                         f"📧 <code>{_hx(email)}</code>\n"
-                        f"<i>{_hx(str(dv_err)[:120])} / {_hx(str(err)[:120])}</i>",
+                        f"<i>{_hx(str(gr_err)[:120])} / {_hx(str(err)[:120])}</i>",
                         parse_mode="HTML")
             except Exception:
                 pass
@@ -33751,15 +33758,6 @@ def _do_tn_verify_fetch(user_id, email, refresh_token, client_id):
         parse_mode="HTML"
     )
 
-    url = "https://tools.dongvanfb.net/api/get_messages_oauth2"
-    payload = {
-        "email": email,
-        "refresh_token": refresh_token,
-        "client_id": client_id,
-        "list_mail": "all"
-    }
-    headers = {"Content-Type": "application/json"}
-
     found_link    = None
     found_subject = None
     found_sender_name = None  # sender এর name (যেমন: "Facebook", "Instagram")
@@ -33771,13 +33769,12 @@ def _do_tn_verify_fetch(user_id, email, refresh_token, client_id):
 
     while elapsed < 30:
         try:
-            resp = http_requests.post(url, json=payload, headers=headers, timeout=10)
-            data = resp.json()
-            logging.info(f"TN verify API response: status={data.get('status')} keys={list(data.keys())}")
+            messages, _gr_err = _graph_inbox_messages(f"{email}||{refresh_token}|{client_id}", timeout=15, top=15)
+            logging.info(f"TN verify Graph: msgs={len(messages)} err={_gr_err!r}")
+            if not messages and str(_gr_err or "").startswith("token:"):
+                break    # token/অ্যাকাউন্ট সমস্যা — আর অপেক্ষা করে লাভ নেই
 
-            if data.get("status") is True or data.get("status") == "true" or data.get("status") == 1:
-                # API documentation অনুযায়ী: messages → list
-                messages = data.get("messages") or data.get("data") or data.get("emails") or data.get("list") or []
+            if messages:
 
                 if isinstance(messages, list):
                     for mail in messages:
@@ -34015,8 +34012,8 @@ def cmd_otpdebug(message):
             rows.append(f"• {_hx(str(m.get('from') or '')[:20])} | {_hx(str(m.get('subject') or '')[:45])} | code={_hx(m.get('code') or '-')} | {_hx(m.get('date') or '')}")
         return "\n".join(rows) or "(কোনো মেসেজ নেই)"
     out = [f"📧 <code>{_hx(fd.split('|')[0])}</code> (parts={fd.count('|') + 1})"]
-    dvm, dve = _dongvan_get_messages(fd)
-    out.append(f"0️⃣ <b>dongvanfb</b> err={_hx(dve)}\ncount={len(dvm)}\n{_brief(dvm)}")
+    dvm, dve = _graph_inbox_messages(fd)
+    out.append(f"0️⃣ <b>Graph API</b> err={_hx(dve)}\ncount={len(dvm)}\n{_brief(dvm)}")
     d, e = mailgen_inbox_read(fd)
     out.append(f"1️⃣ <b>inbox-read</b> err={_hx(e)}\ntotal={(d or {}).get('totalMessages')}\n{_brief((d or {}).get('messages'))}")
     for mode in ("oauth", "graph"):
