@@ -18431,11 +18431,90 @@ def _msg_is_verifyish(msg):
     t = _msg_text(msg).lower()
     return any(k in t for k in _OTP_KEYWORDS)
 
+# ═══════════════════════════════════════════════════════════
+# ✉️ MAIL CODE রিডিং সিস্টেম (main_last.py এর "Mail Code" বাটন থেকে হুবহু নেওয়া)
+# subject → HTML বডি → preview ক্রমে কীওয়ার্ড-ভিত্তিক প্যাটার্ন দিয়ে OTP খোঁজে।
+# Get OTP বাটন ও /code কমান্ড দুটোই _otp_scan_messages → _extract_otp_from_msg
+# দিয়ে যায়, তাই এখানে বসালে দুই জায়গাতেই কাজ করে।
+# ═══════════════════════════════════════════════════════════
+_ML_OTP_SENDERS = {
+    "facebook.com", "instagram.com", "whatsapp.com", "discord.com",
+    "microsoft.com", "google.com", "tiktok.com", "twitter.com",
+    "x.com", "snapchat.com", "linkedin.com", "github.com",
+    "apple.com", "amazon.com", "netflix.com", "spotify.com",
+    "telegram.org", "proton.me", "protonmail.com",
+}
+_ML_OTP_SENDERS_KEYWORDS = [
+    "facebook", "instagram", "whatsapp", "discord", "microsoft",
+    "google", "tiktok", "twitter", "snapchat", "linkedin",
+    "github", "apple", "amazon", "netflix", "spotify",
+    "verification", "verify", "confirm", "code", "otp",
+    "security", "login", "sign in", "account",
+]
+_ML_OTP_PATTERNS = [
+    re.compile(r'(?:code|otp|pin|verification|verify|confirm|token|key|auth(?:entication)?(?:\s*code)?)[:\s#=-]*\s*(\d{4,8})', re.I),
+    re.compile(r'(?:your|is)\s+(?:code|otp|pin|token|key|number)[:\s#=-]*\s*(\d{4,8})', re.I),
+    re.compile(r'(?:enter|use|input|type)\s+(?:this\s+)?(?:code|otp|pin|token|key)[:\s#=-]*\s*(\d{4,8})', re.I),
+    re.compile(r'(?: verification| security)\s+(?:code|number)[:\s#=-]*\s*(\d{4,8})', re.I),
+    re.compile(r'(?:^|\s)(\d{6})(?:\s|$|[.,!?;:])', re.M),
+    re.compile(r'(?:^|\s)(\d{4,8})(?:\s|$|[.,!?;:])', re.M),
+]
+
+def _ml_extract_otp_from_text(text):
+    """Extract a verification code (4-8 digits) from email text. (main_last.py)"""
+    if not text:
+        return None
+    for pat in _ML_OTP_PATTERNS:
+        m = pat.search(text)
+        if m:
+            return m.group(1)
+    return None
+
+def _ml_extract_otp_from_html(html_body):
+    """HTML ট্যাগ সরিয়ে plain text থেকে OTP বের করে। (main_last.py)"""
+    if not html_body:
+        return None
+    import html as _h
+    plain = re.sub(r'<br\s*/?\s*>', '\n', str(html_body), flags=re.I)
+    plain = re.sub(r'<[^>]+>', ' ', plain)
+    plain = _h.unescape(plain)
+    plain = re.sub(r'[ \t]+', ' ', plain)
+    return _ml_extract_otp_from_text(plain)
+
+def _ml_is_verification_msg(msg):
+    """মেইলটা verification/OTP ধরনের কিনা (main_last.py এর _is_verification_email এর মতো)।
+    host এর normalized msg এ 'from' = "Name <addr>" স্ট্রিং।"""
+    frm = str(msg.get("from") or "").lower()
+    for domain in _ML_OTP_SENDERS:
+        if domain in frm:
+            return True
+    combined = f"{str(msg.get('subject') or '').lower()} {str(msg.get('preview') or '').lower()} {frm}"
+    return any(kw in combined for kw in _ML_OTP_SENDERS_KEYWORDS)
+
+def _ml_extract_otp_from_msg(msg):
+    """main_last.py এর ক্রম: subject → HTML বডি → preview। verification-ধরনের মেইল না হলে None।"""
+    if not _ml_is_verification_msg(msg):
+        return None
+    otp = _ml_extract_otp_from_text(str(msg.get("subject") or ""))
+    if not otp:
+        # Graph থেকে আসা মেসেজে raw 'html' থাকে; MailGen এ না থাকলে plain 'message' ব্যবহার
+        otp = _ml_extract_otp_from_html(msg.get("html")) if msg.get("html") else _ml_extract_otp_from_text(str(msg.get("message") or ""))
+    if not otp:
+        otp = _ml_extract_otp_from_text(str(msg.get("preview") or ""))
+    return otp
+
 def _extract_otp_from_msg(msg):
-    """মেসেজ থেকে OTP কোড বের করে (API এর নিজস্ব 'code' ফিল্ড থাকলে সেটাই আগে)।"""
+    """মেসেজ থেকে OTP কোড বের করে (API এর নিজস্ব 'code' ফিল্ড থাকলে সেটাই আগে,
+    তারপর main_last.py এর Mail Code রিডিং সিস্টেম, সবশেষে পুরোনো fallback)।"""
     api_code = str(msg.get("code") or "").strip()
     if api_code:
         return api_code
+    try:
+        ml_code = _ml_extract_otp_from_msg(msg)
+        if ml_code:
+            return ml_code
+    except Exception as _e:
+        logging.warning(f"_ml_extract_otp_from_msg error: {_e}")
     txt = _msg_text(msg)
     # 1) কীওয়ার্ডের কাছাকাছি সংখ্যা (যেমন "code: 123456", "123456 is your code")
     m = re.search(r"(?:code|otp|pin|কোড)\D{0,20}?(?<![\d])(\d{4,8})(?!\d)", txt, re.I)
