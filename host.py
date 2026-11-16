@@ -34276,7 +34276,7 @@ def _do_code_fetch(user_id, email, refresh_token, client_id):
                 extra = ""
             bot.send_message(user_id,
                 f"📭 <b>{OTP_WAIT_MAX_SEC} সেকেন্ডে কোনো কোড/লিংক আসেনি</b>\n\n📧 <code>{_hx(email)}</code>\n\n"
-                f"👉 <b>আগে এই মেইলের মধ্যে কোড পাঠান</b>, <b>তারপর আবার 💻 Code</> চাপুন।</b>" + extra,
+                f"👉 <b>আগে এই মেইলের মধ্যে কোড পাঠান</b>, <b>তারপর আবার 💻 Code চাপুন।</b>" + extra,
                 parse_mode="HTML", reply_markup=_otp_retry_markup(user_id, email))
     except Exception as e:
         logging.exception(f"_do_code_fetch error: {type(e).__name__}: {e}")
