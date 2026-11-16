@@ -9063,6 +9063,10 @@ def _gm_run_otp(chat_id, uid, tok, restore_kb=None):
     if not item or str(item.get("u")) != uid:
         bot.send_message(chat_id, "⚠️ এই মেইলটি আপনার কেনা মেইলের তালিকায় নেই।", reply_markup=restore_kb)
         return
+    if item.get("rf"):                            # 💸 লগইন হয়নি বলে refund হয়ে গেছে
+        bot.send_message(chat_id, "💸 এই মেইলের টাকা <b>refund</b> করা হয়েছে (IMAP লগইন হয়নি)। নতুন মেইল কিনুন।",
+                         parse_mode="HTML", reply_markup=restore_kb)
+        return
     if _gm_is_expired(item):                      # ⏳ মেয়াদ শেষ → OTP দেওয়া হবে না
         bot.send_message(chat_id, _gm_expired_text(item), parse_mode="HTML", reply_markup=restore_kb)
         return
@@ -9361,7 +9365,156 @@ def _gm_purchase(user_id, product_name, quantity, price, total_price, show_name,
     orders_list.append(order_entry)
     db["users"][user_id]["orders"] = orders_list
     update_db_path(f"/users/{user_id}", db["users"][user_id])
+    # 💸 কেনার পর IMAP লগইন চেক (ব্যাকগ্রাউন্ড) — না হলে সাথে সাথে refund
+    try:
+        threading.Thread(
+            target=_gm_post_purchase_login_check,
+            args=(user_id, product_name, plat, list(saved), list(got), round(total_price / max(quantity, 1), 2), order_id),
+            daemon=True, name=f"gm_logincheck_{order_id}").start()
+    except Exception as _lc_e:
+        logging.error(f"gmail login-check thread start error: {_lc_e}")
     return True
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# 💸 AUTO REFUND — কেনা Gmail এ IMAP লগইন না হলে সাথে সাথে টাকা ফেরত
+#   • কেনা + ডেলিভারির পর ব্যাকগ্রাউন্ডে প্রতিটা মেইলে imap.gmail.com এ লগইন চেক হয়
+#   • লগইন ব্যর্থ (পাসওয়ার্ড ভুল/IMAP বন্ধ ইত্যাদি) হলে ওই মেইলের দাম ইউজারের balance এ ফেরত যায়
+#   • নেটওয়ার্ক/টাইমআউট/Google এর সাময়িক সমস্যা হলে refund হয় না (ভুল refund এড়াতে)
+#   • ব্যর্থ মেইল বাকি সব সার্ভিসের স্টক থেকেও সরে যায় (GM_AUTO_REMOVE_BAD_MAIL) — যাতে আরেকজন না পায়
+# ───────────────────────────────────────────────────────────────────────────
+GM_AUTO_REFUND_ON_LOGIN_FAIL = True
+GM_AUTO_REMOVE_BAD_MAIL      = True
+_GM_IMAP_TRANSIENT = ("too many", "temporar", "unavailable", "try again", "system error",
+                      "busy", "timed out", "timeout", "rate limit", "quota")
+
+def _gm_imap_login_check(address, app_password):
+    """IMAP লগইন যাচাই। রিটার্ন: ("ok"|"auth_fail"|"error", detail)।
+    auth_fail ধরা হয় শুধু দুইবার পরপর (৩ সেকেন্ড বিরতিতে) পরিষ্কার login-reject হলে।"""
+    pw = re.sub(r"\s+", "", str(app_password or ""))
+    last_kind, last_detail = "error", ""
+    for attempt in range(2):
+        M = None
+        try:
+            try:
+                M = imaplib.IMAP4_SSL("imap.gmail.com", 993, timeout=20)
+            except TypeError:
+                M = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+            M.login(address, pw)
+            return "ok", ""
+        except imaplib.IMAP4.error as e:
+            msg = str(e)
+            if any(k in msg.lower() for k in _GM_IMAP_TRANSIENT):
+                last_kind, last_detail = "error", msg[:150]
+            else:
+                last_kind, last_detail = "auth_fail", msg[:150]
+        except Exception as e:                      # নেটওয়ার্ক/SSL/timeout — মেইলের দোষ নয়
+            last_kind, last_detail = "error", f"{type(e).__name__}: {e}"[:150]
+        finally:
+            if M is not None:
+                try:
+                    M.logout()
+                except Exception:
+                    pass
+        if attempt == 0:
+            _gm_time.sleep(3)
+    return last_kind, last_detail
+
+def _gm_refund_one(user_id, tok, email, amount, order_id, product_name, reason):
+    """১টা মেইলের টাকা ফেরত (idempotent — item এ rf ফ্ল্যাগ বসে)। True = refund হয়েছে।"""
+    user_id = str(user_id)
+    rec = _gm_get_item(tok)
+    if not rec or rec.get("rf"):
+        return False
+    _mysql_atomic_rw(f"gm_item:{tok}", lambda cur: ({**cur, "rf": int(_gm_time.time())} if isinstance(cur, dict) else cur))
+    try:
+        with get_user_lock(user_id):
+            db = load_db()
+            u = db["users"].get(user_id)
+            if not u:
+                raise RuntimeError("user not found")
+            new_bal = round(float(u.get("balance", 0)) + float(amount), 2)
+            orders = _normalize_orders_list(u.get("orders", []))
+            for o in orders:
+                if isinstance(o, dict) and o.get("id") == order_id:
+                    o["refunded_amount"] = round(float(o.get("refunded_amount", 0)) + float(amount), 2)
+                    o["refunded_count"] = int(o.get("refunded_count", 0)) + 1
+                    if o["refunded_count"] >= int(o.get("quantity", 1) or 1):
+                        o["status"] = "refunded"
+                    break
+            u["balance"] = new_bal
+            u["orders"] = orders
+            update_db_path(f"/users/{user_id}/balance", new_bal, _async=False)
+            update_db_path(f"/users/{user_id}/orders", orders, _async=False)
+            _update_db_cache_in_place(db)
+    except Exception as e:
+        logging.error(f"gmail auto-refund FAILED user={user_id} tok={tok}: {e}\n{traceback.format_exc()}")
+        try:      # refund হয়নি → ফ্ল্যাগ ফিরিয়ে নাও যাতে আবার চেষ্টা করা যায়
+            _mysql_atomic_rw(f"gm_item:{tok}", lambda cur: ({k: v for k, v in cur.items() if k != "rf"} if isinstance(cur, dict) else cur))
+        except Exception:
+            pass
+        return False
+    log_action("GMAIL_AUTO_REFUND", user_id, f"order={order_id} email={email} amount={amount} reason={reason}")
+    return True
+
+def _gm_post_purchase_login_check(user_id, product_name, plat, saved, got, unit_paid, order_id):
+    """কেনার পরে ব্যাকগ্রাউন্ডে চলে: সব মেইলে IMAP লগইন চেক → ব্যর্থ হলে refund + ইউজার/অ্যাডমিনকে জানানো।"""
+    user_id = str(user_id)
+    try:
+        from concurrent.futures import ThreadPoolExecutor as _TPE
+        pairs = list(zip(saved, got))                       # ((tok, email), (email, pw))
+        with _TPE(max_workers=5) as ex:
+            results = list(ex.map(lambda p: _gm_imap_login_check(p[1][0], p[1][1]), pairs))
+        failed = [(pairs[i], results[i][1]) for i in range(len(pairs)) if results[i][0] == "auth_fail"]
+        errored = [pairs[i][1][0] for i in range(len(pairs)) if results[i][0] == "error"]
+        if errored:
+            logging.warning(f"gmail post-purchase login check: network/transient error for {len(errored)} mail(s) — refund করা হয়নি")
+        if not failed or not GM_AUTO_REFUND_ON_LOGIN_FAIL:
+            return
+        total_refund, ok_items = 0.0, []
+        for ((tok, em), (_e, _pw)), detail in failed:
+            if _gm_refund_one(user_id, tok, em, unit_paid, order_id, product_name, detail):
+                total_refund = round(total_refund + unit_paid, 2)
+                ok_items.append((em, detail))
+        if not ok_items:
+            return
+        removed_n = 0
+        if GM_AUTO_REMOVE_BAD_MAIL:
+            try:
+                rem, _err = _gm_rm_apply({_gm_ekey(em) for em, _d in ok_items})
+                removed_n = len(rem)
+            except Exception as _re:
+                logging.error(f"gmail bad-mail stock removal error: {_re}")
+        try:
+            new_bal = load_db()["users"][user_id].get("balance", 0)
+        except Exception:
+            new_bal = "-"
+        lines = "\n".join(f"• <code>{_gm_e(em)}</code>" for em, _d in ok_items)
+        try:
+            bot.send_message(user_id,
+                f"⚠️ <b>IMAP লগইন হয়নি — Refund দেওয়া হয়েছে</b>\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+                f"নিচের {len(ok_items)} টা মেইলে লগইন করা যায়নি:\n{lines}\n\n"
+                f"💸 <b>Refund:</b> {total_refund} BDT\n"
+                f"💳 <b>নতুন Balance:</b> {new_bal} BDT\n"
+                f"🆔 Order: <code>{_gm_e(order_id)}</code>\n\n"
+                f"আপনি চাইলে আবার কিনতে পারেন।",
+                parse_mode="HTML")
+        except Exception as e:
+            logging.error(f"gmail refund user-notify error: {e}")
+        try:
+            if True:
+                bot.send_message(ADMIN_ID,
+                    f"💸 <b>Gmail Auto Refund</b>\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+                    f"👤 User: <code>{user_id}</code>\n📦 {_gm_e(product_name)}\n"
+                    f"🆔 Order: <code>{_gm_e(order_id)}</code>\n"
+                    f"💰 Refund: {total_refund} BDT ({len(ok_items)} pcs)\n\n{lines}\n\n"
+                    f"<i>{_gm_e(ok_items[0][1])}</i>\n"
+                    + (f"🗑️ বাকি {removed_n} টা সার্ভিসের স্টক থেকেও মেইলগুলো সরানো হয়েছে।" if GM_AUTO_REMOVE_BAD_MAIL else ""),
+                    parse_mode="HTML")
+        except Exception as e:
+            logging.error(f"gmail refund admin-notify error: {e}")
+    except Exception as e:
+        logging.error(f"_gm_post_purchase_login_check error: {e}\n{traceback.format_exc()}")
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -9541,6 +9694,202 @@ def _gm_bulk_stock_run(user_id, data, filename, wait_msg_id=None):
         bot.send_message(user_id, text[:4000], parse_mode="HTML", reply_markup=get_main_menu(user_id))
     except Exception as e:
         logging.error(f"gm bulk stock summary send error: {e}")
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# 🗑️ GMAIL STOCK REMOVE — যেকোনো মেইল লিখে দিলে সব সার্ভিসের স্টক থেকে একসাথে মুছে যায়
+#   • ১টা বা একাধিক মেইল (প্রতি লাইনে ১টা; `email|pass` লিখলেও চলবে) → আগে কোন সার্ভিসে কতটা আছে দেখায়
+#   • ✅ Remove চাপলেই মুছবে। শুধু *স্টক* থেকে মোছে — আগে বিক্রি হওয়া/ক্রেতার মেইলে হাত দেয় না।
+# ───────────────────────────────────────────────────────────────────────────
+_GM_FIND_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+_gm_rm_pending = {}          # {admin_uid: {"keys": {ekey: email}, "ts": ...}}  (শুধু RAM)
+_GM_RM_TTL = 1800
+_GM_RM_MAX = 2000
+
+def _gm_rm_scan(target_keys):
+    """সব Gmail সার্ভিসের স্টক ফাইল পড়ে — রিটার্ন: ({product_name: [removable row count]}, {found ekeys})।"""
+    per, found = {}, set()
+    for key, meta in GMAIL_PLATFORMS.items():
+        pn = meta["product"]
+        path = os.path.join(STOCK_DIR, f"{pn}.xlsx")
+        if not os.path.exists(path):
+            continue
+        n = 0
+        try:
+            with get_stock_lock(pn):
+                wb = openpyxl.load_workbook(path, read_only=True)
+                for i, r in enumerate(wb.active.iter_rows(values_only=True)):
+                    if i == 0:
+                        continue
+                    it = _gm_row_to_item(["" if c is None else str(c) for c in r])
+                    if it:
+                        ek = _gm_ekey(it[0])
+                        if ek in target_keys:
+                            n += 1
+                            found.add(ek)
+                wb.close()
+        except Exception as e:
+            logging.warning(f"gm remove scan error ({pn}): {e}")
+        if n:
+            per[pn] = n
+    return per, found
+
+def _gm_rm_apply(target_keys):
+    """সব Gmail সার্ভিসের স্টক ফাইল থেকে মেইলগুলো মোছে। রিটার্ন: ({product_name: removed_count}, errors)।"""
+    removed, errors = {}, []
+    for key, meta in GMAIL_PLATFORMS.items():
+        pn = meta["product"]
+        path = os.path.join(STOCK_DIR, f"{pn}.xlsx")
+        if not os.path.exists(path):
+            continue
+        try:
+            with get_stock_lock(pn):
+                wb = openpyxl.load_workbook(path, read_only=True)
+                header, kept, n_rm = None, [], 0
+                for i, r in enumerate(wb.active.iter_rows(values_only=True)):
+                    if i == 0:
+                        header = [_stock_plain_value(c) for c in r]
+                        continue
+                    if not any(c is not None and str(c).strip() != "" for c in r):
+                        continue
+                    cells = [_stock_plain_value(c) for c in r]
+                    it = _gm_row_to_item(cells)
+                    if it and _gm_ekey(it[0]) in target_keys:
+                        n_rm += 1
+                        continue
+                    kept.append(cells)
+                wb.close()
+                if not n_rm:
+                    continue
+                tmp = path + ".tmp"
+                out_wb = openpyxl.Workbook(write_only=True)
+                out_ws = out_wb.create_sheet(title="Sheet1")
+                out_ws.append(header if header else list(_GM_STOCK_HEADER))
+                for c in kept:
+                    out_ws.append(c)
+                out_wb.save(tmp)
+                out_wb.close()
+                os.replace(tmp, path)
+                _local_count_prime(pn, len(kept))
+                try:
+                    if _stock_sync_ready:
+                        _stock_sync_push(f"{pn}.xlsx", locked_by_caller=True)   # MySQL এও সাথে সাথে সেভ
+                except Exception as _se:
+                    logging.error(f"gm remove: MySQL sync failed [{pn}]: {_se}")
+            invalidate_stock_cache(pn)
+            removed[pn] = n_rm
+        except Exception as e:
+            logging.error(f"gm remove apply error ({pn}): {e}\n{traceback.format_exc()}")
+            errors.append(pn)
+    return removed, errors
+
+def _gm_stock_remove_prompt(user_id):
+    """অ্যাডমিন প্যানেলের 🗑️ Gmail Stock Remove বাটন → মেইল চাওয়া হয়।"""
+    msg = bot.send_message(
+        user_id,
+        "🗑️ <b>Gmail Stock Remove</b>\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+        "যে মেইল স্টক থেকে সরাতে চান সেটা লিখুন — <b>সব সার্ভিসের স্টক</b> থেকে একসাথে মুছে যাবে।\n\n"
+        "📝 একাধিক হলে প্রতি লাইনে ১টা করে লিখুন:\n"
+        "<code>name@gmail.com</code>\n"
+        "<i>(email|app_password লিখলেও চলবে)</i>",
+        parse_mode="HTML", reply_markup=get_cancel_button(user_id))
+    bot.register_next_step_handler(msg, _gm_stock_remove_step)
+
+def _gm_stock_remove_step(message):
+    user_id = str(message.chat.id)
+    if (message.text or "") in ("❌ Cancel", "❌ বাতিল"):
+        show_admin_panel(user_id); return
+    if not is_admin(user_id):
+        return
+    text = message.text or ""
+    emails = []
+    seen = set()
+    for em in _GM_FIND_EMAIL_RE.findall(_GM_ZW_RE.sub("", text)):
+        k = _gm_ekey(em)
+        if k not in seen:
+            seen.add(k)
+            emails.append(em)
+    if not emails:
+        msg = bot.send_message(user_id, "❌ <b>কোনো সঠিক মেইল পাওয়া যায়নি!</b>\nআবার লিখুন (যেমন: <code>name@gmail.com</code>):",
+                               parse_mode="HTML", reply_markup=get_cancel_button(user_id))
+        bot.register_next_step_handler(msg, _gm_stock_remove_step); return
+    if len(emails) > _GM_RM_MAX:
+        emails = emails[:_GM_RM_MAX]
+    keys = {_gm_ekey(e): e for e in emails}
+    wait = bot.send_message(user_id, "⏳ <b>সব সার্ভিসের স্টকে খোঁজা হচ্ছে…</b>", parse_mode="HTML")
+    _EXECUTOR.submit(_gm_stock_remove_preview, user_id, keys, wait.message_id)
+
+def _gm_stock_remove_preview(user_id, keys, wait_msg_id=None):
+    try:
+        per, found = _gm_rm_scan(set(keys.keys()))
+    except Exception as e:
+        logging.error(f"gm remove preview error: {e}\n{traceback.format_exc()}")
+        bot.send_message(user_id, "❌ স্টকে খুঁজতে সমস্যা হয়েছে, আবার চেষ্টা করুন।", reply_markup=get_main_menu(user_id))
+        return
+    try:
+        if wait_msg_id:
+            bot.delete_message(user_id, wait_msg_id)
+    except Exception:
+        pass
+    total_rows = sum(per.values())
+    missing = [e for k, e in keys.items() if k not in found]
+    if not total_rows:
+        lst = "\n".join(f"• <code>{_gm_e(e)}</code>" for e in list(keys.values())[:20])
+        bot.send_message(user_id, f"ℹ️ <b>কোনো সার্ভিসের স্টকে এই মেইল পাওয়া যায়নি।</b>\n\n{lst}",
+                         parse_mode="HTML", reply_markup=get_main_menu(user_id))
+        return
+    _gm_rm_pending[user_id] = {"keys": dict(keys), "ts": _gm_time.time()}
+    name_of = {m["product"]: f"{m['emoji']} {_gm_e(m['name'])}" for m in GMAIL_PLATFORMS.values()}
+    lines = [f"{name_of.get(pn, _gm_e(pn))}: <b>{n}</b>" for pn, n in per.items()]
+    txt = (f"🗑️ <b>Gmail Stock Remove — Preview</b>\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+           f"📧 মেইল: <b>{len(keys)}</b> টা (স্টকে পাওয়া গেছে: <b>{len(found)}</b>)\n"
+           f"📦 মুছবে: <b>{len(per)}</b> টা সার্ভিস থেকে, মোট <b>{total_rows}</b> pcs\n\n"
+           + "\n".join(lines))
+    if missing:
+        shown = "\n".join(f"• <code>{_gm_e(e)}</code>" for e in missing[:10])
+        txt += f"\n\n⚠️ <b>কোনো স্টকে নেই ({len(missing)}):</b>\n{shown}" + ("\n…" if len(missing) > 10 else "")
+    txt += "\n\n👉 Remove চাপলে ওপরের সব সার্ভিসের স্টক থেকে মুছে যাবে।"
+    mk = types.InlineKeyboardMarkup()
+    mk.row(InlineBtn(f"🗑️ Remove ({total_rows} pcs)", style="danger", callback_data="gmrm_ok"),
+           InlineBtn("❌ Cancel", style="primary", callback_data="gmrm_cancel"))
+    bot.send_message(user_id, txt[:4000], parse_mode="HTML", reply_markup=mk)
+
+@bot.callback_query_handler(func=lambda c: c.data in ("gmrm_ok", "gmrm_cancel"))
+def cb_gm_stock_remove(call):
+    uid = str(call.from_user.id)
+    if not is_admin(uid):
+        bot.answer_callback_query(call.id, "❌ Admin access only!", show_alert=True)
+        return
+    sess = _gm_rm_pending.pop(uid, None)          # pop → ডাবল-ট্যাপে দুইবার চলবে না
+    try:
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+    except Exception:
+        pass
+    if call.data == "gmrm_cancel":
+        bot.answer_callback_query(call.id, "❌ বাতিল")
+        bot.send_message(uid, "❌ <b>Remove বাতিল।</b> স্টকে কিছু বদলায়নি।", parse_mode="HTML")
+        return
+    if not sess or (_gm_time.time() - sess["ts"]) > _GM_RM_TTL:
+        bot.answer_callback_query(call.id, "⚠️ সেশন শেষ — আবার মেইল লিখুন।", show_alert=True)
+        return
+    bot.answer_callback_query(call.id, "⏳ মোছা হচ্ছে...")
+    def _run():
+        try:
+            removed, errors = _gm_rm_apply(set(sess["keys"].keys()))
+            name_of = {m["product"]: f"{m['emoji']} {_gm_e(m['name'])}" for m in GMAIL_PLATFORMS.values()}
+            lines = [f"{name_of.get(pn, _gm_e(pn))}: <b>-{n}</b>  (এখন <code>{get_stock_count(pn)}</code>)"
+                     for pn, n in removed.items()]
+            txt = (f"✅ <b>Gmail Stock Remove সম্পন্ন</b>\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+                   f"🗑️ মোট মুছেছে: <b>{sum(removed.values())}</b> pcs ({len(removed)} টা সার্ভিস থেকে)\n\n"
+                   + ("\n".join(lines) if lines else "কিছু মোছা হয়নি (ইতিমধ্যে নেই)।"))
+            if errors:
+                txt += f"\n\n⚠️ error হয়েছে: {', '.join(_gm_e(x) for x in errors)}"
+            bot.send_message(uid, txt[:4000], parse_mode="HTML", reply_markup=get_main_menu(uid))
+            log_action("GMAIL_STOCK_REMOVE", uid, f"emails={len(sess['keys'])} rows={sum(removed.values())}")
+        except Exception as e:
+            logging.error(f"gm stock remove run error: {e}\n{traceback.format_exc()}")
+            bot.send_message(uid, "❌ Remove করতে সমস্যা হয়েছে।", reply_markup=get_main_menu(uid))
+    _EXECUTOR.submit(_run)
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -10467,6 +10816,9 @@ def cleanup_old_deposit_requests(db=None):
     now_dt = datetime.now(BD_TZ)
     to_delete = []
     for req_id, req in list(deposits.items()):
+        # 🔒 Pending রিকোয়েস্ট কখনো অটো-ডিলেট হবে না — এডমিন approve/reject না করা পর্যন্ত থাকবে
+        if (req or {}).get("status") == "pending":
+            continue
         # approved/rejected হলে approved_date, না হলে date ব্যবহার করো
         date_str = req.get("approved_date") or req.get("date")
         entry_dt = _parse_bd_datetime(date_str)
@@ -11434,8 +11786,16 @@ def _load_section(section):
         return result
     # ⚡ আগে: প্রতি key আলাদা query (config এ ~৩০টা)। এখন: ১টাই query।
     try:
-        _raw_map = _mysql_get_many(keys)
-        for key in keys:
+        # 🔥 FIX (pending deposit হারিয়ে যাওয়া): deposit_requests/users প্রতি-রো sharded
+        # (deposit:<id> / user:<id>) — এগুলো `data_key IN (...)` batch query তে পাওয়া যায় না
+        # (exact key নেই), ফলে cache reload এ {} ফিরত এবং pending request গায়েব হয়ে যেত।
+        # তাই sharded key গুলো _fb_ref (prefix query) দিয়ে, বাকিগুলো batch এ আনা হয়।
+        _sharded = [k for k in keys if k in _SHARD_MAP]
+        _plain = [k for k in keys if k not in _SHARD_MAP]
+        for key in _sharded:
+            result[key] = _load_one_key(key)
+        _raw_map = _mysql_get_many(_plain) if _plain else {}
+        for key in _plain:
             raw = _raw_map.get(key)
             default_val = _DB_DEFAULT.get(key)
             if raw is None:
@@ -12155,12 +12515,15 @@ def _proxy_delivery_msg(host, port, user, pw):
         "✅ 𝐒𝐚𝐯𝐞 𝐭𝐡𝐞𝐬𝐞 𝐝𝐞𝐭𝐚𝐢𝐥𝐬 𝐬𝐞𝐜𝐮𝐫𝐞𝐥𝐲."
     )
 
-def stock_merge_upload_bytes(product_name, data_bytes, filename=None):
+def stock_merge_upload_bytes(product_name, data_bytes, filename=None, dry_run=False, row_filter=None):
     """Admin এর আপলোড করা .xlsx / .csv / .txt ফাইল কে product এর stock এ heading অনুযায়ী merge/save করে।
       • sheet এর heading যা আছে হুবহু সেটাই stock এর heading হয়
       • আগের stock এ অন্য heading থাকলে নাম ধরে column মিলিয়ে বসায় (নতুন heading হলে নতুন column)
       • link/hyperlink সব plain text URL হিসেবে সেভ হয়
-    Return: (merge_mode, added_count, old_count)"""
+    Return: (merge_mode, added_count, old_count)
+    dry_run=True  → ফাইলে কিছুই লেখে না; {"merge_mode","new_rows","existing_rows"} dict রিটার্ন করে
+                    (new_rows = স্টকে যে layout এ বসত সেই layout এর rows; আপলোড preview/summary এর জন্য)
+    row_filter    → f(row)->bool; False হলে ওই row আপলোড হয় না (duplicate/sold বাদ দিতে)"""
     rows, _src_kind = _stock_rows_from_upload(data_bytes, filename)
     while rows and not any(rows[0]):
         rows.pop(0)
@@ -12229,27 +12592,44 @@ def stock_merge_upload_bytes(product_name, data_bytes, filename=None):
                     ex_headers.append(h)
                     col_of[h.lower()] = len(ex_headers) - 1
                     ws.cell(row=1, column=len(ex_headers), value=h)
+            _final_rows = []
             for r in data_rows:
                 out = [""] * len(ex_headers)
                 for i, v in enumerate(r):
                     if i < len(headers):
                         out[col_of[headers[i].lower()]] = v
+                _final_rows.append(out)
+            if dry_run:
+                _ex_rows = [[_stock_cell_text(c) for c in _r] for _r in allr[1:]
+                            if any(_stock_cell_text(c) for c in _r)]
+                wb.close()
+                return {"merge_mode": True, "new_rows": _final_rows, "existing_rows": _ex_rows}
+            if row_filter:
+                _final_rows = [o for o in _final_rows if row_filter(o)]
+            for out in _final_rows:
                 ws.append(out)
             wb.save(path); wb.close()
             merge_mode, old_count = True, ex_count
+            _added = len(_final_rows)
         else:
             # ── নতুন / খালি stock → sheet এর heading দিয়েই নতুন ফাইল ──
             if wb is not None:
                 wb.close()
+            _final_rows = [list(r) + [""] * (len(headers) - len(r)) for r in data_rows]
+            if dry_run:
+                return {"merge_mode": False, "new_rows": _final_rows, "existing_rows": []}
+            if row_filter:
+                _final_rows = [o for o in _final_rows if row_filter(o)]
             out_wb = openpyxl.Workbook()
             out_ws = out_wb.active
             out_ws.append(headers)
-            for r in data_rows:
-                out_ws.append(list(r) + [""] * (len(headers) - len(r)))
+            for out in _final_rows:
+                out_ws.append(out)
             out_wb.save(path); out_wb.close()
             merge_mode, old_count = False, 0
+            _added = len(_final_rows)
     invalidate_stock_cache(product_name)
-    return merge_mode, len(data_rows), old_count
+    return merge_mode, _added, old_count
 
 def read_single_account_text(product_name):
     """
@@ -18410,7 +18790,7 @@ OTP_WAIT_MAX_SEC      = OTP_GRAPH_PHASE_SEC + OTP_MG_PHASE_SEC   # মোট (�
 OTP_GRAPH_INTERVAL_SEC = 3     # Graph API প্রতি কত সেকেন্ড পরপর চেক
 OTP_CHECK_INTERVAL_SEC = 2     # MailGen প্রতি কত সেকেন্ড পরপর চেক
 OTP_MAX_API_ERRORS    = 3      # (পুরোনো কনস্ট্যান্ট — সামঞ্জস্যের জন্য রাখা)
-OTP_MAX_AGE_SEC       = 1800   # ৩০ মিনিটের পুরোনো কোড (তারিখ নিশ্চিত হলে) দেখাবে না
+OTP_MAX_AGE_SEC       = 1800   # ৩০ মিনিটের মধ্যের কোড = "latest"; এর বাইরে হলে আগে latest খোঁজে, না পেলে শেষে পুরাতনটা দেখায়
 _otp_busy = {}   # {user_id: start_ts} — ডাবল ক্লিকে একই সাথে দুইবার চেক আটকাতে
 
 _OTP_KEYWORDS = ("code", "otp", "verify", "verification", "confirm", "security",
@@ -18775,7 +19155,7 @@ def _graph_inbox_messages(full_data, timeout=20, top=10):
     except Exception as e:
         return [], f"{type(e).__name__}: {e}"
 
-def _otp_fetch_mailgen(full_data):
+def _otp_fetch_mailgen(full_data, max_age=None):
     """MailGen এক রাউন্ড: inbox-read → get-inbox (oauth → graph)।
     রিটার্ন: (found, seen_msgs, dbg_dict)।"""
     dbg = {"ir": None, "gi": None, "n_ir": 0, "n_gi": 0}
@@ -18785,7 +19165,7 @@ def _otp_fetch_mailgen(full_data):
     dbg["n_ir"] = len(ir_msgs)
     if ir_msgs:
         seen = ir_msgs
-        found = _otp_scan_messages(ir_msgs[:5])      # শুধু সর্বশেষ ৫টা — পুরোনো কোড এড়াতে
+        found = _otp_scan_messages(ir_msgs[:5], max_age=max_age)      # আগে latest
         if found:
             return found, seen, dbg
     gi_msgs, dbg["gi"] = _mailgen_get_inbox_try(full_data, "oauth")
@@ -18798,7 +19178,7 @@ def _otp_fetch_mailgen(full_data):
     dbg["n_gi"] = len(gi_msgs)
     if gi_msgs:
         seen = seen or gi_msgs
-        found = _otp_scan_messages(gi_msgs[:5])
+        found = _otp_scan_messages(gi_msgs[:5], max_age=max_age)
         if found:
             return found, seen, dbg
     return None, seen, dbg
@@ -18808,7 +19188,7 @@ def _otp_scan_messages(messages, max_age=None):
     (msg, code, links) অথবা None।"""
     _now = _time_module.time()
     for m in messages or []:
-        _ts = m.get("_ts")
+        _ts = m.get("_ts") or _otp_parse_ts(m.get("date"))   # MailGen মেসেজে _ts না থাকলে date থেকে
         if max_age and _ts and (_now - _ts) > max_age:
             continue    # অনেক পুরোনো মেইল — ভুল/expired কোড দেখাবে না
         code = _extract_otp_from_msg(m)
@@ -18822,7 +19202,29 @@ def _get_last_account(user_id):
     """এই buy মেনু সেশনে কেনা সর্বশেষ মেইল (শুধু RAM)। বের হয়ে গেলে/রিস্টার্টের পর None।"""
     return _last_delivered_account.get(str(user_id))
 
-def _otp_send_result(user_id, email, found):
+_otp_retry_ctx = {}   # {user_id: {token: ctx}} — 🔄 Try Again বাটনের জন্য শেষ ইনবক্স-রিড ডেটা (শুধু RAM)
+
+def _otp_retry_token(user_id, email, ctx):
+    """Try Again বাটনের জন্য ctx মনে রাখে; callback_data তে শুধু ছোট token যায় (full data নয়)।"""
+    import hashlib as _hl
+    tok = _hl.md5(str(email or "").lower().encode("utf-8")).hexdigest()[:8]
+    d = _otp_retry_ctx.setdefault(str(user_id), {})
+    d[tok] = ctx
+    while len(d) > 10:
+        d.pop(next(iter(d)))
+    return tok
+
+def _otp_retry_btn(user_id, email):
+    import hashlib as _hl
+    t = _hl.md5(str(email or "").lower().encode("utf-8")).hexdigest()[:8]
+    return InlineBtn("🔄 Try Again", style="primary", callback_data=f"otp_retry|{t}")
+
+def _otp_retry_markup(user_id, email):
+    mk = types.InlineKeyboardMarkup(row_width=1)
+    mk.add(_otp_retry_btn(user_id, email))
+    return mk
+
+def _otp_send_result(user_id, email, found, is_old=False):
     m, code, links = found
     service = _otp_service_name(m)
     t_str = _otp_fmt_time(m.get("date"))
@@ -18837,6 +19239,9 @@ def _otp_send_result(user_id, email, found):
         for i, u in enumerate(links[:2], start=1):
             markup.add(InlineBtn("🔗 Verify Link" + ("" if len(links) == 1 else f" {i}"),
                                  style="primary", url=u))
+    if is_old:
+        head = head + "\n⚠️ <i>নতুন কোড পাওয়া যায়নি — ইনবক্সের সবচেয়ে সাম্প্রতিক পুরোনো কোড দেখানো হলো</i>"
+    markup.add(_otp_retry_btn(user_id, email))
     text = (f"{head}\n\n"
             f"📧 <b>Email:</b> <code>{_hx(email)}</code>\n"
             f"🏷️ <b>Service:</b> {_hx(service)}\n"
@@ -18877,6 +19282,7 @@ def handle_get_otp_from_keyboard(user_id, db):
         bot.send_message(user_id, "⏳ আপনার আগের চেক এখনো চলছে, একটু অপেক্ষা করুন।", reply_markup=kb)
         return
     _otp_busy[user_id] = _time_module.time()
+    _otp_retry_token(user_id, email, {"src": "otp", "email": email, "full_data": full_data})
     # আলাদা thread এ চালাও — ৩০ সেকেন্ড পর্যন্ত অপেক্ষা করলেও bot worker pool আটকাবে না
     threading.Thread(target=_otp_check_worker, args=(user_id, email, full_data),
                      daemon=True, name=f"otp_check_{user_id}").start()
@@ -18915,7 +19321,7 @@ def _otp_check_worker(user_id, email, full_data):
             mg_ran = True
             p2 = _time_module.time()
             while True:
-                found, _seen, _dbg = _otp_fetch_mailgen(full_data)
+                found, _seen, _dbg = _otp_fetch_mailgen(full_data, max_age=OTP_MAX_AGE_SEC)
                 if _seen and not seen_msgs:
                     seen_msgs = _seen
                 err, full_err = _dbg["ir"], _dbg["gi"]
@@ -18927,6 +19333,15 @@ def _otp_check_worker(user_id, email, full_data):
                     break
                 _time_module.sleep(OTP_CHECK_INTERVAL_SEC)
 
+        # ── ধাপ ৩: latest পাওয়া যায়নি → ইনবক্সের পুরোনো মেসেজ থেকে (নতুন→পুরোনো ক্রমে) ──
+        is_old = False
+        if not found and seen_msgs:
+            try:
+                found = _otp_scan_messages(seen_msgs)
+                is_old = bool(found)
+            except Exception as _oe:
+                logging.warning(f"old OTP fallback error: {_oe}")
+
         try:
             bot.delete_message(user_id, wait_msg.message_id)
         except Exception:
@@ -18934,7 +19349,7 @@ def _otp_check_worker(user_id, email, full_data):
 
         all_failed = (not seen_msgs) and bool(gr_err) and mg_ran and bool(err) and bool(full_err)
         if found:
-            _otp_send_result(user_id, email, found)
+            _otp_send_result(user_id, email, found, is_old=is_old)
         elif all_failed:
             # ইউজারকে কোনো সাইট/এরর ডিটেইল দেখানো হয় না — শুধু Email আর সময় (BD)
             _now_bd = datetime.now(BD_TZ).strftime("%I:%M:%S %p - %d/%m/%Y") + " (BD)"
@@ -18942,7 +19357,7 @@ def _otp_check_worker(user_id, email, full_data):
                 f"❌ <b>Inbox চেক করা যায়নি!</b>\n\n"
                 f"📧 <b>Email:</b> <code>{_hx(email)}</code>\n"
                 f"🕒 <b>Time:</b> {_now_bd}",
-                parse_mode="HTML", reply_markup=kb)
+                parse_mode="HTML", reply_markup=_otp_retry_markup(user_id, email))
             # আসল কারণ শুধু অ্যাডমিনকে (ইউজার অ্যাডমিন না হলে আলাদা মেসেজ)
             try:
                 if not is_admin(user_id):
@@ -18973,15 +19388,55 @@ def _otp_check_worker(user_id, email, full_data):
                 f"👉 <b>আগে এই মেইলের মধ্যে কোড পাঠান</b> (যে সাইট/অ্যাপে মেইলটা ব্যবহার করবেন সেখানে "
                 f"এই মেইল দিয়ে কোড রিকোয়েস্ট করুন), <b>তারপর 📩 Get OTP বাটনে ক্লিক করুন।</b>"
                 + extra,
-                parse_mode="HTML", reply_markup=kb)
+                parse_mode="HTML", reply_markup=_otp_retry_markup(user_id, email))
     except Exception as e:
-        logging.error(f"_otp_check_worker error: {e}")
+        logging.exception(f"_otp_check_worker error: {type(e).__name__}: {e}")
         try:
-            bot.send_message(user_id, "❌ কিছু একটা সমস্যা হয়েছে, আবার চেষ্টা করুন।", reply_markup=kb)
+            bot.send_message(user_id, "❌ কিছু একটা সমস্যা হয়েছে, আবার চেষ্টা করুন।",
+                             reply_markup=_otp_retry_markup(user_id, email))
+        except Exception:
+            pass
+        try:   # আসল কারণ অ্যাডমিনকে (ইউজার অ্যাডমিন হলে নিজেকেই)
+            bot.send_message(ADMIN_ID,
+                f"🔍 <b>OTP Worker Crash</b>\n👤 <code>{user_id}</code>\n📧 <code>{_hx(email)}</code>\n"
+                f"<code>{_hx(type(e).__name__)}: {_hx(str(e)[:300])}</code>", parse_mode="HTML")
         except Exception:
             pass
     finally:
         _otp_busy.pop(str(user_id), None)
+
+@bot.callback_query_handler(func=lambda c: (c.data or "").startswith("otp_retry|"))
+def cb_otp_retry(call):
+    """🔄 Try Again — একই মেইলের ইনবক্স আবার পড়ে (Get OTP / Code দুটোর জন্যই)।"""
+    uid = str(call.from_user.id)
+    try:
+        try:
+            if uid in (load_db().get("banned_users") or {}):
+                bot.answer_callback_query(call.id); return
+        except Exception:
+            pass
+        tok = (call.data or "").split("|", 1)[1]
+        ctx = (_otp_retry_ctx.get(uid) or {}).get(tok)
+        if not ctx:
+            bot.answer_callback_query(call.id, "⚠️ সেশন শেষ। আবার 📩 Get OTP / 💻 Code চাপুন।", show_alert=True)
+            return
+        started = _otp_busy.get(uid)
+        if started and (_time_module.time() - started) < (OTP_WAIT_MAX_SEC + 30):
+            bot.answer_callback_query(call.id, "⏳ আগের চেক এখনো চলছে, একটু অপেক্ষা করুন।", show_alert=True)
+            return
+        bot.answer_callback_query(call.id, "🔄 আবার ইনবক্স পড়া হচ্ছে...")
+        if ctx.get("src") == "code":
+            _EXECUTOR.submit(_do_code_fetch, uid, ctx["email"], ctx["refresh_token"], ctx["client_id"])
+        else:
+            _otp_busy[uid] = _time_module.time()
+            threading.Thread(target=_otp_check_worker, args=(uid, ctx["email"], ctx["full_data"]),
+                             daemon=True, name=f"otp_retry_{uid}").start()
+    except Exception as e:
+        logging.error(f"cb_otp_retry error: {e}")
+        try:
+            bot.answer_callback_query(call.id, "❌ সমস্যা হয়েছে, আবার চেষ্টা করুন।")
+        except Exception:
+            pass
 
 # ===========================
 # 2FA KEY → CODE GENERATOR
@@ -19349,7 +19804,7 @@ def _text_message_worker(message):
 # 🔢 SHOP BUTTON ORDER — Admin Panel Controlled
 # ══════════════════════════════════════════════════════
 # Buy Mail শপ মেনুর ভিতরের বাটনগুলোর (Edu Mail, সাধারণ প্রোডাক্ট, Product1,
-# Product2) পজিশন/অবস্থান admin panel থেকে সেট করা যায় (🔢 Shop Button
+# Product2) পজিশন/অবস্থান admin panel থেকে সেট করা যায় (?? Shop Button
 # Order)। db["settings"]["shop_button_order"] এ item-key গুলোর ক্রম অনুযায়ী
 # একটা list persist হয়। কোনো নতুন প্রোডাক্ট/বাটন যোগ হলে সেটা স্বয়ংক্রিয়ভাবে
 # লিস্টের শেষে যোগ হয়ে যায় (আগের কাস্টম অর্ডার নষ্ট না করেই), আর ডিলিট হওয়া/
@@ -24087,6 +24542,11 @@ def _process_deposit_request_inner(message, user_id, method, account, amount, is
                 logging.info(f"PENDING (SMS not received yet) | User={user_id} | TrxID={transaction_id} | Method={method} | Amount={amount}")
 
                 try:
+                    _pm = types.InlineKeyboardMarkup()
+                    _pm.add(
+                        InlineBtn("✅ Approve", style="success", callback_data=f"dep_approve_{request_id}"),
+                        InlineBtn("❌ Reject", style="danger", callback_data=f"dep_reject_{request_id}")
+                    )
                     bot.send_message(ADMIN_ID,
                         f"⏳ <b>Pending Deposit (পেমেন্ট এখনো কনফার্ম হয়নি)</b>\n\n"
                         f"👤 User: <code>{user_id}</code> (@{get_cached_username(user_id)})\n"
@@ -24095,8 +24555,8 @@ def _process_deposit_request_inner(message, user_id, method, account, amount, is
                         f"💰 Amount: {amount} BDT\n"
                         f"🆔 Request: <code>{request_id}</code>\n"
                         f"📅 {current_time}\n\n"
-                        f"<i>Payment received হলে TrxID+Amount match হয়ে অটো approve হবে।</i>",
-                        parse_mode="HTML")
+                        f"<i>Payment received হলে TrxID+Amount match হয়ে অটো approve হবে, অথবা নিচের বাটনে নিজে approve/reject করুন।</i>",
+                        parse_mode="HTML", reply_markup=_pm)
                 except: pass
 
                 bot.send_message(user_id,
@@ -24326,7 +24786,11 @@ def show_pending_deposits(admin_id):
     pending = {k: v for k, v in db["deposit_requests"].items() if v["status"] == "pending"}
     if not pending:
         bot.send_message(admin_id, "✅ <b>No pending deposits</b>", parse_mode="HTML"); return
-    for req_id, data in list(pending.items())[:5]:
+    _PEND_LIMIT = 20
+    if len(pending) > _PEND_LIMIT:
+        bot.send_message(admin_id, f"⏳ <b>মোট Pending: {len(pending)}টা</b> — প্রথম {_PEND_LIMIT}টা দেখানো হচ্ছে। "
+                                   f"এগুলো approve/reject করে আবার Pending খুলুন।", parse_mode="HTML")
+    for req_id, data in list(pending.items())[:_PEND_LIMIT]:
         auto_badge = "⚡ Auto" if data.get("is_auto") else "🔵 Manual"
         # ✅ Binance এর transaction_id শুধু request_id এর duplicate,
         # তাই আলাদা TrxID লাইন না দেখিয়ে শুধু Request ID দেখানো হচ্ছে।
@@ -24936,6 +25400,9 @@ def show_admin_panel(user_id):
     )
     markup.add(
         InlineBtn("📮 Bulk API Gmail Stock", style="success", callback_data="admin_gm_bulk_stock")
+    )
+    markup.add(
+        InlineBtn("🗑️ Gmail Stock Remove", style="danger", callback_data="admin_gm_stock_remove")
     )
     _gm_chk_u = _gm_chk_url()
     markup.add(
@@ -26581,6 +27048,135 @@ def _unsold_worker(call):
     except Exception as e:
         _cw_generic_crash_handler(call, "handle_unsold_callback", e)
 
+# ═══════════════════════════════════════════════════════════════════════
+# 🔎 LOCAL STOCK UPLOAD — আগে Summary (Duplicate / Sell হয়েছে / Sell হয়নি), তারপর Confirm
+#   • Sell হয়েছে  : MySQL delivered-ledger এ আগেই আছে (এই প্রোডাক্টে আগে বিক্রি হয়েছে)
+#   • Duplicate   : স্টকে আগে থেকেই আছে, অথবা একই ফাইলে একাধিকবার আছে
+#   • Sell হয়নি   : নতুন — শুধু এগুলোই Confirm করলে upload হবে
+# ═══════════════════════════════════════════════════════════════════════
+_stock_upload_pending = {}      # {admin_uid: {product, data, fname, ts}}  (শুধু RAM)
+_STOCK_UPLOAD_PENDING_TTL = 1800
+
+def _ledger_find_sold(product_name, hashes):
+    """hash লিস্টের মধ্যে কোনগুলো আগেই বিক্রি (ledger এ আছে) — শুধু পড়ে, কিছু লেখে না।
+    রিটার্ন: (sold_hash_set, error_or_None)"""
+    uniq = list({h for h in hashes if h})
+    found = set()
+    if not uniq:
+        return found, None
+    try:
+        _ledger_ensure()
+        conn = _get_stock_conn()
+        for off in range(0, len(uniq), 400):
+            part = uniq[off:off + 400]
+            with conn.cursor() as cur:
+                ph = ",".join(["%s"] * len(part))
+                cur.execute(f"SELECT item_hash FROM bot_delivered_items WHERE item_hash IN ({ph})", part)
+                found.update(r[0] for r in cur.fetchall())
+        return found, None
+    except Exception as e:
+        logging.error(f"_ledger_find_sold error [{product_name}]: {e}")
+        return set(), str(e)[:100]
+
+def _stock_upload_analyze(product_name, data_bytes, filename):
+    """আপলোড ফাইল বিশ্লেষণ (কিছু লেখে না)। রিটার্ন dict:
+    total, fresh, dup_stock, dup_file, sold, ledger_err, keep (row_filter ফাংশন)"""
+    res = stock_merge_upload_bytes(product_name, data_bytes, filename, dry_run=True)
+    new_rows = res["new_rows"]
+    ex_hashes = {_ledger_row_hash(product_name, r) for r in res["existing_rows"]}
+    hashes = [_ledger_row_hash(product_name, r) for r in new_rows]
+    sold_set, ledger_err = _ledger_find_sold(product_name, hashes)
+    seen, fresh, dup_stock, dup_file, sold = set(), 0, 0, 0, 0
+    for h in hashes:
+        if h in sold_set:
+            sold += 1
+        elif h in ex_hashes:
+            dup_stock += 1
+        elif h in seen:
+            dup_file += 1
+        else:
+            seen.add(h)
+            fresh += 1
+
+    _seen2 = set()
+    def keep(row):
+        h = _ledger_row_hash(product_name, row)
+        if h in sold_set or h in ex_hashes or h in _seen2:
+            return False
+        _seen2.add(h)
+        return True
+
+    return {"total": len(new_rows), "fresh": fresh, "dup_stock": dup_stock, "dup_file": dup_file,
+            "sold": sold, "ledger_err": ledger_err, "keep": keep}
+
+def _stock_upload_preview(user_id, product_name, data_bytes, filename):
+    """Summary দেখিয়ে Confirm/Cancel বাটন পাঠায়; ফাইল RAM এ রাখে।"""
+    user_id = str(user_id)
+    try:
+        an = _stock_upload_analyze(product_name, data_bytes, filename)
+    except Exception as e:
+        bot.send_message(user_id, f"❌ <b>ফাইল পড়া যায়নি!</b>\n\n<code>{_hx(str(e)[:200])}</code>",
+                         parse_mode="HTML", reply_markup=get_main_menu(user_id))
+        return
+    now_ts = _time_module.time()
+    for k in [k for k, v in _stock_upload_pending.items() if now_ts - v["ts"] > _STOCK_UPLOAD_PENDING_TTL]:
+        _stock_upload_pending.pop(k, None)
+    _stock_upload_pending[user_id] = {"product": product_name, "data": data_bytes,
+                                      "fname": filename, "ts": now_ts}
+    dup_total = an["dup_stock"] + an["dup_file"]
+    txt = (f"📊 <b>Stock Upload Summary</b>\n"
+           f"📦 <b>Product:</b> {_hx(str(_vpn_display_name(product_name)))}\n"
+           f"📄 <b>ফাইলে মোট:</b> {an['total']} pcs\n"
+           f"━━━━━━━━━━━━━━━━\n"
+           f"✅ <b>Sell হয়নি (নতুন):</b> {an['fresh']} pcs\n"
+           f"♻️ <b>Duplicate:</b> {dup_total} pcs"
+           + (f"  <i>(স্টকে আছে: {an['dup_stock']} | ফাইলে একাধিক: {an['dup_file']})</i>" if dup_total else "") + "\n"
+           f"🚫 <b>Sell হয়ে গেছে:</b> {an['sold']} pcs\n"
+           f"━━━━━━━━━━━━━━━━\n")
+    if an["ledger_err"]:
+        txt += "⚠️ <i>Sell-হিসাব (ledger) চেক করা যায়নি — Sell সংখ্যা ঠিক নাও হতে পারে।</i>\n"
+    mk = types.InlineKeyboardMarkup()
+    if an["fresh"] > 0:
+        txt += f"👉 Confirm করলে শুধু <b>{an['fresh']} pcs</b> upload হবে (Duplicate ও Sell-হওয়াগুলো বাদ)।"
+        mk.row(InlineBtn(f"✅ Upload Confirm ({an['fresh']} pcs)", style="success", callback_data="stkup_ok"),
+               InlineBtn("❌ Cancel", style="danger", callback_data="stkup_cancel"))
+    else:
+        txt += "ℹ️ আপলোড করার মতো নতুন ডেটা নেই।"
+        mk.row(InlineBtn("❌ Cancel", style="danger", callback_data="stkup_cancel"))
+    bot.send_message(user_id, txt, parse_mode="HTML", reply_markup=mk)
+
+@bot.callback_query_handler(func=lambda c: c.data in ("stkup_ok", "stkup_cancel"))
+def cb_stock_upload_confirm(call):
+    uid = str(call.from_user.id)
+    if not is_admin(uid):
+        bot.answer_callback_query(call.id, "❌ Admin access only!", show_alert=True)
+        return
+    sess = _stock_upload_pending.pop(uid, None)      # pop → ডাবল-ট্যাপে দুইবার upload হবে না
+    try:
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+    except Exception:
+        pass
+    if call.data == "stkup_cancel":
+        bot.answer_callback_query(call.id, "❌ Upload বাতিল")
+        bot.send_message(uid, "❌ <b>Upload বাতিল করা হয়েছে।</b> কিছু সেভ হয়নি।", parse_mode="HTML")
+        return
+    if not sess or (_time_module.time() - sess["ts"]) > _STOCK_UPLOAD_PENDING_TTL:
+        bot.answer_callback_query(call.id, "⚠️ সেশন শেষ — আবার ফাইল পাঠান।", show_alert=True)
+        return
+    bot.answer_callback_query(call.id, "⏳ Uploading...")
+    try:
+        pn = sess["product"]
+        an = _stock_upload_analyze(pn, sess["data"], sess["fname"])     # confirm এর মুহূর্তে আবার fresh চেক
+        if an["fresh"] <= 0:
+            bot.send_message(uid, "ℹ️ আপলোড করার মতো নতুন ডেটা নেই — কিছু upload হয়নি।")
+            return
+        merge_mode, added, _old = stock_merge_upload_bytes(pn, sess["data"], sess["fname"], row_filter=an["keep"])
+        _admin_stock_finish(uid, pn, merge_mode, added)
+    except Exception as e:
+        logging.error(f"stock upload confirm error: {e}\n{traceback.format_exc()}")
+        bot.send_message(uid, f"❌ <b>Upload failed!</b>\n\n<code>{_hx(str(e)[:200])}</code>", parse_mode="HTML",
+                         reply_markup=get_main_menu(uid))
+
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback_queries(call):
     # ⚡ INSTANT ACK — বাটন ক্লিকের সাথে সাথে Telegram কে জানাও
@@ -27211,6 +27807,9 @@ def _callback_worker_impl(call):
 
     elif callback_data == "admin_gm_bulk_stock":
         _gm_bulk_stock_prompt(user_id)
+
+    elif callback_data == "admin_gm_stock_remove":
+        _gm_stock_remove_prompt(user_id)
 
     elif callback_data == "admin_gm_chk":
         bot.send_message(user_id, "⚠️ Mail Checker চালাতে HTTPS public URL লাগবে (PUBLIC_URL সেট করুন)।")
@@ -30303,7 +30902,19 @@ def admin_upload_stock_step2(message, product_name):
             # 📮 Gmail: `email|app_password` লাইন যাচাই + ডুপ্লিকেট/বিক্রি-হওয়া মেইল বাদ
             merge_mode, added_count, old_count = _gm_stock_upload(user_id, product_name, downloaded_file, message.document.file_name)
         else:
-            merge_mode, added_count, old_count = stock_merge_upload_bytes(product_name, downloaded_file, message.document.file_name)
+            # 🔎 আগে summary (duplicate / sell হয়েছে / sell হয়নি) দেখাও — Confirm করলে তবেই upload হবে
+            _stock_upload_preview(user_id, product_name, downloaded_file, message.document.file_name)
+            return
+        _admin_stock_finish(user_id, product_name, merge_mode, added_count)
+    except Exception as e:
+        import html as _html_err
+        safe_err = _html_err.escape(str(e))
+        bot.send_message(user_id, f"❌ <b>Upload failed!</b>\n\n<code>{safe_err}</code>",
+            parse_mode="HTML", reply_markup=get_main_menu(user_id))
+
+def _admin_stock_finish(user_id, product_name, merge_mode, added_count):
+    """Stock সেভ হওয়ার পর: স্ট্যাটাস মেসেজ + Broadcast permission।"""
+    try:
         db = load_db()
         # cache আগেই clear হয়েছে (merge/new উভয় path এ) — সরাসরি fresh count নাও
         stock_count = get_stock_count(product_name)
@@ -30392,6 +31003,7 @@ def admin_upload_stock_step2(message, product_name):
         safe_err = _html_err.escape(str(e))
         bot.send_message(user_id, f"❌ <b>Upload failed!</b>\n\n<code>{safe_err}</code>",
             parse_mode="HTML", reply_markup=get_main_menu(user_id))
+
 
 def admin_edu_mail_rename_step(message, cat_short, item_no):
     user_id = str(message.chat.id)
@@ -33570,6 +34182,8 @@ def _do_code_fetch(user_id, email, refresh_token, client_id):
                          reply_markup=get_main_menu(user_id))
         return
     _otp_busy[user_id] = _time_module.time()
+    _otp_retry_token(user_id, email, {"src": "code", "email": email,
+                                      "refresh_token": refresh_token, "client_id": client_id})
     wait_msg = None
     try:
         wait_msg = bot.send_message(
@@ -33602,7 +34216,7 @@ def _do_code_fetch(user_id, email, refresh_token, client_id):
             mg_ran = True
             p2 = _time_module.time()
             while True:
-                found, _seen, _dbg = _otp_fetch_mailgen(full_data)
+                found, _seen, _dbg = _otp_fetch_mailgen(full_data, max_age=OTP_MAX_AGE_SEC)
                 if _seen and not seen_msgs:
                     seen_msgs = _seen
                 err, full_err = _dbg["ir"], _dbg["gi"]
@@ -33614,6 +34228,15 @@ def _do_code_fetch(user_id, email, refresh_token, client_id):
                     break
                 _time_module.sleep(OTP_CHECK_INTERVAL_SEC)
 
+        # ── ধাপ ৩: latest পাওয়া যায়নি → ইনবক্সের পুরোনো মেসেজ থেকে (নতুন→পুরোনো ক্রমে) ──
+        is_old = False
+        if not found and seen_msgs:
+            try:
+                found = _otp_scan_messages(seen_msgs)
+                is_old = bool(found)
+            except Exception as _oe:
+                logging.warning(f"old OTP fallback error: {_oe}")
+
         try:
             bot.delete_message(user_id, wait_msg.message_id)
         except Exception:
@@ -33621,7 +34244,7 @@ def _do_code_fetch(user_id, email, refresh_token, client_id):
 
         all_failed = (not seen_msgs) and bool(gr_err) and mg_ran and bool(err) and bool(full_err)
         if found:
-            _otp_send_result(user_id, email, found)
+            _otp_send_result(user_id, email, found, is_old=is_old)
             bot.send_message(user_id, t(user_id, "main_menu"),
                              reply_markup=get_main_menu(user_id), parse_mode="HTML")
         elif all_failed:
@@ -33631,7 +34254,7 @@ def _do_code_fetch(user_id, email, refresh_token, client_id):
                 f"📧 <b>Email:</b> <code>{_hx(email)}</code>\n"
                 f"🕒 <b>Time:</b> {_now_bd}\n\n"
                 f"⚠️ token/অ্যাকাউন্ট ঠিক আছে কিনা দেখুন, অথবা একটু পরে আবার চেষ্টা করুন।",
-                parse_mode="HTML", reply_markup=get_main_menu(user_id))
+                parse_mode="HTML", reply_markup=_otp_retry_markup(user_id, email))
             try:
                 if not is_admin(user_id):
                     bot.send_message(ADMIN_ID,
@@ -33654,12 +34277,18 @@ def _do_code_fetch(user_id, email, refresh_token, client_id):
             bot.send_message(user_id,
                 f"📭 <b>{OTP_WAIT_MAX_SEC} সেকেন্ডে কোনো কোড/লিংক আসেনি</b>\n\n📧 <code>{_hx(email)}</code>\n\n"
                 f"👉 <b>আগে এই মেইলের মধ্যে কোড পাঠান</b>, <b>তারপর আবার 💻 Code</> চাপুন।</b>" + extra,
-                parse_mode="HTML", reply_markup=get_main_menu(user_id))
+                parse_mode="HTML", reply_markup=_otp_retry_markup(user_id, email))
     except Exception as e:
-        logging.error(f"_do_code_fetch error: {e}")
+        logging.exception(f"_do_code_fetch error: {type(e).__name__}: {e}")
         try:
             bot.send_message(user_id, "❌ কিছু একটা সমস্যা হয়েছে, আবার চেষ্টা করুন।",
-                             reply_markup=get_main_menu(user_id))
+                             reply_markup=_otp_retry_markup(user_id, email))
+        except Exception:
+            pass
+        try:
+            bot.send_message(ADMIN_ID,
+                f"🔍 <b>Code Worker Crash</b>\n👤 <code>{user_id}</code>\n📧 <code>{_hx(email)}</code>\n"
+                f"<code>{_hx(type(e).__name__)}: {_hx(str(e)[:300])}</code>", parse_mode="HTML")
         except Exception:
             pass
     finally:
