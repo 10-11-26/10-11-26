@@ -8434,6 +8434,7 @@ GMAIL_PLATFORMS = {
     "gm_chamet":    {"product": "Gmail Chamet",    "name": "Chamet",    "emoji": "🎥"},
     "gm_owlproxy":  {"product": "Gmail Owl Proxy",  "name": "Owl Proxy", "emoji": "🦉"},
     "gm_oxylabs":   {"product": "Gmail Oxylabs",   "name": "Oxylabs",   "emoji": "🔶"},
+    "gm_imo":       {"product": "Gmail Imo",       "name": "Imo",       "emoji": "💙"},
 }
 # প্রথম ৫টার বাইরে যেগুলো পরে যোগ হয়েছে — পুরোনো DB তেও একবার product বানাতে (gmail_products_init_v2)
 GMAIL_NEW_PLATFORM_KEYS = ["gm_amazon", "gm_whatsapp", "gm_twitter", "gm_discord", "gm_microsoft", "gm_pinterest",
@@ -8447,6 +8448,8 @@ GMAIL_NEW_PLATFORM_KEYS_V4 = ["gm_chamet"]
 GMAIL_NEW_PLATFORM_KEYS_V5 = ["gm_owlproxy"]
 # v6 — Oxylabs (পুরোনো DB তে একবার product বানাতে — gmail_products_init_v6)
 GMAIL_NEW_PLATFORM_KEYS_V6 = ["gm_oxylabs"]
+# v7 — Imo (পুরোনো DB তে একবার product বানাতে — gmail_products_init_v7)
+GMAIL_NEW_PLATFORM_KEYS_V7 = ["gm_imo"]
 GMAIL_PRODUCT_TO_KEY = {m["product"]: k for k, m in GMAIL_PLATFORMS.items()}
 OTP_PAGE_PATH = "/otp"
 
@@ -8482,6 +8485,7 @@ GMAIL_SENDERS = {          # প্ল্যাটফর্ম -> প্রে�
     "gm_chamet": ["chamet"],                      # "chamet" — ডোমেইনের ভেতরে থাকলেই মিলবে (chamet.com / chametw.com ইত্যাদি)
     "gm_owlproxy": ["owlproxy.com"],              # Owl Proxy — owlproxy.com ও তার সাবডোমেইন (mail.owlproxy.com ইত্যাদি)
     "gm_oxylabs": ["oxylabs.io"],                 # Oxylabs — oxylabs.io ও তার সাবডোমেইন (mail.oxylabs.io ইত্যাদি)
+    "gm_imo": ["imo.im"],                         # Imo — imo.im ও তার সাবডোমেইন (mail.imo.im ইত্যাদি)
 }
 
 GMAIL_BOXES = ["INBOX", "[Gmail]/Spam"]
@@ -8508,6 +8512,7 @@ _GM_CODE_RE = {            # প্ল্যাটফর্ম -> কোডে�
     "gm_chamet": r"(?<![\d.])(\d{4,8})(?![\d.])",
     "gm_owlproxy": r"(?<![\d.])(\d{4,8})(?![\d.])",
     "gm_oxylabs": r"(?<![\d.])(\d{4,8})(?![\d.])",
+    "gm_imo": r"(?<![\d.])(\d{4,8})(?![\d.])",
 }
 
 def _gm_decode(v):
@@ -35957,6 +35962,17 @@ def auto_init_sub_products():
                     print(f"✅ Gmail product initialized (v6): {_gp}")
             db.setdefault("settings", {})["gmail_products_init_v6"] = True
             update_db_path("/settings/gmail_products_init_v6", True)
+            changed = True
+
+        # ── 📮 Gmail API — Imo সার্ভিস (v7; একবারই; admin ডিলিট করলে ফিরবে না) ──
+        if not (db.get("settings", {}) or {}).get("gmail_products_init_v7"):
+            for _gk in GMAIL_NEW_PLATFORM_KEYS_V7:
+                _gp = GMAIL_PLATFORMS[_gk]["product"]
+                if _gp not in db["products"]:
+                    db["products"][_gp] = 0
+                    print(f"✅ Gmail product initialized (v7): {_gp}")
+            db.setdefault("settings", {})["gmail_products_init_v7"] = True
+            update_db_path("/settings/gmail_products_init_v7", True)
             changed = True
 
         if changed:
